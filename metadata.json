@@ -1,0 +1,8 @@
+{
+  "name": "Remix PrismDesk 媒体宝库",
+  "description": "专为设计师与创作者打造的 Windows 桌面级媒体资源管理软件，支持6大核心区域、自定义封面文件夹、鼠标悬停自动平滑放大预览、跨目录剪贴板操作与安全密码锁屏。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
