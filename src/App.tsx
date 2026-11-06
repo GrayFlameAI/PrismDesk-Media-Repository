@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { 
   SectionId, 
   SectionConfig,
@@ -30,6 +30,7 @@ import {
   pastePhysicalMediaItems,
   deletePhysicalMediaItems,
   renamePhysicalMediaItem,
+  batchRenamePhysicalMediaItems,
   movePhysicalMediaItems,
   copyMediaToSystemClipboard,
   openVaultRootInExplorer,
@@ -43,15 +44,20 @@ import {
   hashPassword,
   extractNativeFilePath,
   releaseVideoFileHandles,
-  isMediaFile
+  isMediaFile,
+  mergeMediaChunkPreservingRefs,
+  reconcileMediaListPreservingRefs,
+  startNativeFileDragOut,
+  isInternalMediaDragActive,
+  clearInternalMediaDragActive
 } from './utils/storage';
 import { useI18n, UI_DICTIONARY } from './locales';
 import { TitleBar } from './components/TitleBar';
 import { Sidebar } from './components/Sidebar';
 import { BreadcrumbBar } from './components/BreadcrumbBar';
 import { FolderCard } from './components/FolderCard';
-import { MediaCard } from './components/MediaCard';
 import { VirtualGridCell } from './components/VirtualGridCell';
+import { VirtualMediaGrid } from './components/VirtualMediaGrid';
 import { LightboxModal } from './components/LightboxModal';
 import { UploadModal } from './components/UploadModal';
 import { FolderModal } from './components/FolderModal';
@@ -157,20 +163,24 @@ export default function App() {
   const [isSavingCategory, setIsSavingCategory] = useState(false);
   const [pendingDeleteCategory, setPendingDeleteCategory] = useState<SectionConfig | null>(null);
 
-  // Media Card Right-Click Context Menu & Modals (Rename / Move To)
+  // Media Card Right-Click Context Menu & Modals (Single & Multi-Select Batch Rename / Move To)
   const [mediaCtxMenu, setMediaCtxMenu] = useState<{
     x: number;
     y: number;
     item: MediaItem;
+    targetItems: MediaItem[];
   } | null>(null);
-  const [renamingMediaItem, setRenamingMediaItem] = useState<MediaItem | null>(null);
+  const [renamingMediaItems, setRenamingMediaItems] = useState<MediaItem[]>([]);
   const [renameMediaInput, setRenameMediaInput] = useState('');
   const [isRenamingMedia, setIsRenamingMedia] = useState(false);
 
-  const [movingMediaItem, setMovingMediaItem] = useState<MediaItem | null>(null);
+  const [movingMediaItems, setMovingMediaItems] = useState<MediaItem[]>([]);
   const [targetMoveCategoryId, setTargetMoveCategoryId] = useState<string>('');
   const [targetMoveFolderId, setTargetMoveFolderId] = useState<string>('');
   const [isMovingMedia, setIsMovingMedia] = useState(false);
+
+  // Scroll Parent Ref for react-virtuoso VirtualMediaGrid
+  const [scrollParentEl, setScrollParentEl] = useState<HTMLDivElement | null>(null);
 
   // Native Desktop Drag-and-Drop Overlay State
   const [isWindowDragging, setIsWindowDragging] = useState(false);
@@ -223,11 +233,17 @@ export default function App() {
     }, 2800);
   }, []);
 
-  // Scan Physical Disk via Node.js fs
-  const reloadData = useCallback(async (silent = false) => {
+  // 唯一扫描会话锁：防止并发刷新或 fs.watch 热重载导致分批数据交叉覆盖或产生重复复制体
+  const latestScanTokenRef = useRef<number>(0);
+
+  // Scan Physical Disk via Node.js fs (with IPC 50-item chunking + Reference-Preserving Idempotent Reconciliation)
+  const reloadData = useCallback(async (silent = false, allowEmpty = false) => {
+    const currentToken = ++latestScanTokenRef.current;
     try {
       if (!silent) setIsLoading(true);
       const cfg = await getVaultAppConfig();
+      if (currentToken !== latestScanTokenRef.current) return;
+
       const defaultHash = await hashPassword('123456');
       setSecurityConfig({
         isPasswordSet: true,
@@ -245,12 +261,24 @@ export default function App() {
       }
 
       setVaultRootState(cfg.vaultRootPath);
-      const scanned = await scanPhysicalVault();
+      const scanned = await scanPhysicalVault((chunk) => {
+        if (currentToken !== latestScanTokenRef.current) return;
+        // 严格使用增量式函数更新，绝不在收到首批分片 (isFirst) 时清空其他分类/文件夹的数据
+        setAllMedia((prev) => mergeMediaChunkPreservingRefs(prev, chunk));
+      });
+
+      if (currentToken !== latestScanTokenRef.current) return;
+
       setVaultRootState(scanned.vaultRootPath || cfg.vaultRootPath);
       const nextCategories = scanned.categories?.length ? scanned.categories : SECTIONS;
       setCategories(nextCategories);
       setFolders(scanned.folders);
-      setAllMedia(scanned.allMedia);
+      setAllMedia((prev) => {
+        if (scanned.allMedia.length === 0 && prev.length > 0 && silent && !allowEmpty) {
+          return prev;
+        }
+        return reconcileMediaListPreservingRefs(prev, scanned.allMedia);
+      });
 
       setActiveSectionId((prev) => {
         if (nextCategories.some((c) => c.id === prev)) return prev;
@@ -259,7 +287,9 @@ export default function App() {
     } catch (err) {
       console.error('Failed to scan physical vault:', err);
     } finally {
-      if (!silent) setIsLoading(false);
+      if (!silent && currentToken === latestScanTokenRef.current) {
+        setIsLoading(false);
+      }
     }
   }, []);
 
@@ -617,10 +647,37 @@ export default function App() {
     }
   };
 
+  // 保持最新状态引用，确保传递给 MediaCard 的所有回调函数引用 100% 稳定，绝不破坏 React.memo
+  const allMediaRef = useRef<MediaItem[]>(allMedia);
+  useEffect(() => {
+    allMediaRef.current = allMedia;
+  }, [allMedia]);
+
+  const foldersRef = useRef<FolderItem[]>(folders);
+  useEffect(() => {
+    foldersRef.current = folders;
+  }, [folders]);
+
+  const activeFolderRef = useRef<FolderItem | null>(activeFolder);
+  useEffect(() => {
+    activeFolderRef.current = activeFolder;
+  }, [activeFolder]);
+
+  const selectedMediaIdsRef = useRef<Set<string>>(selectedMediaIds);
+  useEffect(() => {
+    selectedMediaIdsRef.current = selectedMediaIds;
+  }, [selectedMediaIds]);
+
+  const orderedMediaListRef = useRef<MediaItem[]>([]);
+  useEffect(() => {
+    orderedMediaListRef.current = isGlobalSearching ? globalMatchedMedia : displayMedia;
+  }, [isGlobalSearching, globalMatchedMedia, displayMedia]);
+
   // Direct Windows Desktop Drag-and-Drop into Application Viewport (Zero-Memory Path Streaming)
   const handleWindowDragEnter = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (isInternalMediaDragActive()) return;
     if (e.dataTransfer.types && Array.from(e.dataTransfer.types).includes('Files')) {
       setIsWindowDragging(true);
     }
@@ -629,6 +686,7 @@ export default function App() {
   const handleWindowDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (isInternalMediaDragActive()) return;
     if (e.dataTransfer) {
       e.dataTransfer.dropEffect = 'copy';
     }
@@ -650,6 +708,10 @@ export default function App() {
     e.preventDefault();
     e.stopPropagation();
     setIsWindowDragging(false);
+    if (isInternalMediaDragActive()) {
+      clearInternalMediaDragActive();
+      return;
+    }
 
     const files = e.dataTransfer?.files;
     if (!files || files.length === 0) return;
@@ -719,31 +781,52 @@ export default function App() {
     }
   };
 
-  const handleDeleteMediaItem = async (id: string) => {
-    const target = allMedia.find((m) => m.id === id);
-    if (!target) return;
-    if (lightboxItemId === id) {
-      setLightboxItemId(null);
-    }
-    setBatchStatus(t('workspace.batchProcessing'));
-    try {
-      // 1. 先从状态卸载对应的 MediaCard 并彻底释放所有 <video> 标签句柄
-      setAllMedia((prev) => prev.filter((m) => m.id !== id));
-      setSelectedMediaIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-      await releaseVideoFileHandles();
+  const handleOpenLightbox = useCallback((item: MediaItem) => {
+    setLightboxItemId(item.id);
+  }, []);
 
-      // 2. 调用主进程安全移入回收站（含 EBUSY 重试机制）
-      await deletePhysicalMediaItems([target]);
-      await reloadData(true);
-      showToast(t('toast.mediaDeleted', { name: target.name }));
-    } finally {
-      setBatchStatus(null);
+  /**
+   * 任务四：支持原生文件拖拽到外部应用 (Windows 桌面、PS、PR、剪映等)
+   * 如果被拖拽的卡片处于多选列表中，支持一次性将所有已选物理文件批量拖出到外部应用
+   */
+  const handleNativeDragOutMedia = useCallback((item: MediaItem, posterUrl?: string) => {
+    const selectedSet = selectedMediaIdsRef.current;
+    const ordered = orderedMediaListRef.current;
+    let selectedItems: MediaItem[] = [item];
+    if (selectedSet.has(item.id) && selectedSet.size > 1) {
+      const matched = ordered.filter((m) => selectedSet.has(m.id));
+      selectedItems = matched.length > 0 ? matched : [item];
     }
-  };
+    startNativeFileDragOut(item, selectedItems, posterUrl);
+  }, []);
+
+  const handleDeleteMediaItem = useCallback(
+    async (id: string) => {
+      const target = allMediaRef.current.find((m) => m.id === id);
+      if (!target) return;
+      setLightboxItemId((prev) => (prev === id ? null : prev));
+      setBatchStatus(t('workspace.batchProcessing'));
+      try {
+        // 1. 先从状态卸载对应的 MediaCard 并彻底释放所有 <video> 标签句柄
+        setAllMedia((prev) => prev.filter((m) => m.id !== id));
+        setSelectedMediaIds((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        await releaseVideoFileHandles();
+
+        // 2. 调用主进程安全移入回收站（含 EBUSY 重试机制）
+        await deletePhysicalMediaItems([target]);
+        await reloadData(true, true);
+        showToast(t('toast.mediaDeleted', { name: target.name }));
+      } finally {
+        setBatchStatus(null);
+      }
+    },
+    [reloadData, showToast, t]
+  );
 
   const handleBatchDelete = async () => {
     if (selectedMediaIds.size === 0) return;
@@ -759,54 +842,99 @@ export default function App() {
       await releaseVideoFileHandles();
 
       await deletePhysicalMediaItems(targets);
-      await reloadData(true);
+      await reloadData(true, true);
       showToast(t('toast.batchDeleted', { count: targets.length }));
     } finally {
       setBatchStatus(null);
     }
   };
 
-  // Media Card Right-Click Context Menu Handlers
-  const handleMediaContextMenu = (e: React.MouseEvent, item: MediaItem) => {
+  // Media Card Right-Click Context Menu Handlers (Supports Single & Multi-Select Linked Batch Actions)
+  const handleMediaContextMenu = useCallback((e: React.MouseEvent, item: MediaItem) => {
     e.preventDefault();
     e.stopPropagation();
-    const menuWidth = 210;
-    const menuHeight = 200;
+    const menuWidth = 230;
+    const menuHeight = 215;
     const x = Math.min(e.clientX, window.innerWidth - menuWidth - 12);
     const y = Math.min(e.clientY, window.innerHeight - menuHeight - 12);
-    setMediaCtxMenu({ x, y, item });
-  };
 
-  const handleOpenRenameMediaModal = (item: MediaItem) => {
+    const currentOrderedList = orderedMediaListRef.current;
+    const currentSelected = selectedMediaIdsRef.current;
+    let targetItems: MediaItem[] = [item];
+
+    // 判断触发右键的卡片是否在已选列表 (selectedMediaIds) 中：
+    // 1. 如果在已选列表中，则将“整个选中的文件数组”作为操作目标；
+    // 2. 如果不在已选列表中，则将该卡片设为当前唯一选中项并作为单文件操作目标。
+    if (currentSelected.has(item.id)) {
+      const orderedSelected = currentOrderedList.filter((m) => currentSelected.has(m.id));
+      targetItems =
+        orderedSelected.length > 0
+          ? orderedSelected
+          : allMediaRef.current.filter((m) => currentSelected.has(m.id));
+    } else {
+      setSelectedMediaIds(new Set([item.id]));
+      targetItems = [item];
+    }
+
+    setMediaCtxMenu({ x, y, item, targetItems });
+  }, []);
+
+  const handleOpenRenameMediaModal = (items: MediaItem[]) => {
+    if (!items || items.length === 0) return;
     setMediaCtxMenu(null);
-    setRenamingMediaItem(item);
-    setRenameMediaInput(item.name);
+    setRenamingMediaItems(items);
+    if (items.length === 1) {
+      setRenameMediaInput(items[0].name);
+    } else {
+      // 批量重命名时默认提取首个文件去除扩展名与末尾序号后的基础名称
+      const firstBase = items[0].name
+        .replace(/\.[^/.]+$/, '')
+        .replace(/_\d+$/, '');
+      setRenameMediaInput(firstBase || '素材');
+    }
   };
 
   const handleSubmitRenameMedia = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!renamingMediaItem || !renameMediaInput.trim()) return;
+    const cleanInput = renameMediaInput.trim();
+    if (renamingMediaItems.length === 0 || !cleanInput) return;
     setIsRenamingMedia(true);
+    setBatchStatus(t('workspace.batchProcessing'));
     try {
       await releaseVideoFileHandles();
-      await renamePhysicalMediaItem(renamingMediaItem, renameMediaInput.trim());
-      await reloadData(true);
-      showToast(t('toast.mediaRenamed', { name: renameMediaInput.trim() }));
-      setRenamingMediaItem(null);
+      if (renamingMediaItems.length === 1) {
+        await renamePhysicalMediaItem(renamingMediaItems[0], cleanInput);
+        await reloadData(true);
+        showToast(t('toast.mediaRenamed', { name: cleanInput }));
+      } else {
+        const renamedCount = await batchRenamePhysicalMediaItems(renamingMediaItems, cleanInput);
+        setSelectedMediaIds(new Set());
+        await reloadData(true);
+        showToast(
+          t('toast.mediaBatchRenamed', {
+            count: renamedCount || renamingMediaItems.length,
+            base: cleanInput.replace(/\.[^/.]+$/, ''),
+          })
+        );
+      }
+      setRenamingMediaItems([]);
     } catch (err: any) {
       showToast(err?.message || 'Error');
     } finally {
       setIsRenamingMedia(false);
+      setBatchStatus(null);
     }
   };
 
-  const handleOpenMoveMediaModal = (item: MediaItem) => {
+  const handleOpenMoveMediaModal = (items: MediaItem[]) => {
+    if (!items || items.length === 0) return;
     setMediaCtxMenu(null);
-    setMovingMediaItem(item);
-    const defaultCatId = item.sectionId || activeSectionId;
+    setMovingMediaItems(items);
+    const firstItem = items[0];
+    const defaultCatId = firstItem.sectionId || activeSectionId;
     setTargetMoveCategoryId(defaultCatId);
     const catFolders = folders.filter((f) => f.sectionId === defaultCatId);
-    const otherFolder = catFolders.find((f) => f.id !== item.folderId) || catFolders[0];
+    const otherFolder = catFolders.find((f) => f.id !== firstItem.folderId) || catFolders[0];
     setTargetMoveFolderId(otherFolder?.id || '');
   };
 
@@ -818,7 +946,7 @@ export default function App() {
 
   const handleSubmitMoveMedia = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!movingMediaItem || !targetMoveCategoryId) return;
+    if (movingMediaItems.length === 0 || !targetMoveCategoryId) return;
     setIsMovingMedia(true);
     setBatchStatus(t('workspace.batchProcessing'));
     try {
@@ -842,12 +970,28 @@ export default function App() {
         destFolderName = found ? getFolderDisplay(found).name : destFolderId;
       }
 
-      setAllMedia((prev) => prev.filter((m) => m.id !== movingMediaItem.id));
+      const movingIds = new Set(movingMediaItems.map((m) => m.id));
+      setAllMedia((prev) => prev.filter((m) => !movingIds.has(m.id)));
+      setSelectedMediaIds((prev) => {
+        const next = new Set(prev);
+        movingIds.forEach((id) => next.delete(id));
+        return next;
+      });
       await releaseVideoFileHandles();
-      await movePhysicalMediaItems([movingMediaItem], destFolderId);
+      await movePhysicalMediaItems(movingMediaItems, destFolderId);
       await reloadData(true);
-      showToast(t('toast.mediaMoved', { name: movingMediaItem.name, target: destFolderName }));
-      setMovingMediaItem(null);
+
+      if (movingMediaItems.length === 1) {
+        showToast(t('toast.mediaMoved', { name: movingMediaItems[0].name, target: destFolderName }));
+      } else {
+        showToast(
+          t('toast.mediaBatchMoved', {
+            count: movingMediaItems.length,
+            target: destFolderName,
+          })
+        );
+      }
+      setMovingMediaItems([]);
     } catch (err: any) {
       showToast(err?.message || 'Error');
     } finally {
@@ -856,7 +1000,7 @@ export default function App() {
     }
   };
 
-  const handleToggleSelectMedia = (id: string) => {
+  const handleToggleSelectMedia = useCallback((id: string) => {
     setSelectedMediaIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -866,7 +1010,11 @@ export default function App() {
       }
       return next;
     });
-  };
+  }, []);
+
+  const handleBatchSelectMedia = useCallback((nextIds: Set<string>) => {
+    setSelectedMediaIds(new Set(nextIds));
+  }, []);
 
   const handleToggleSelectAll = () => {
     const currentList = isGlobalSearching ? globalMatchedMedia : displayMedia;
@@ -878,14 +1026,17 @@ export default function App() {
   };
 
   // System-Level Clipboard Copy & In-App Paste
-  const handleCopySingleItem = async (item: MediaItem) => {
-    setClipboard({
-      action: 'copy',
-      items: [item],
-    });
-    await copyMediaToSystemClipboard(item);
-    showToast(t('toast.copiedToSystem', { path: item.filePath || item.name }));
-  };
+  const handleCopySingleItem = useCallback(
+    async (item: MediaItem) => {
+      setClipboard({
+        action: 'copy',
+        items: [item],
+      });
+      await copyMediaToSystemClipboard(item);
+      showToast(t('toast.copiedToSystem', { path: item.filePath || item.name }));
+    },
+    [showToast, t]
+  );
 
   const handlePasteClipboard = async () => {
     if (!clipboard || clipboard.items.length === 0 || !activeFolder) return;
@@ -905,18 +1056,22 @@ export default function App() {
   };
 
   // Set Folder Cover permanently via .prism_meta.json
-  const handleSetAsFolderCover = async (item: MediaItem) => {
-    const targetFolder = folders.find((f) => f.id === item.folderId) || activeFolder;
-    if (!targetFolder) return;
-    const updatedFolder: FolderItem = {
-      ...targetFolder,
-      coverSourceFilePath: item.filePath,
-      coverUrl: item.url,
-    };
-    await savePhysicalFolder(updatedFolder, targetFolder.id);
-    await reloadData();
-    showToast(t('toast.coverSet', { name: item.name }));
-  };
+  const handleSetAsFolderCover = useCallback(
+    async (item: MediaItem) => {
+      const targetFolder =
+        foldersRef.current.find((f) => f.id === item.folderId) || activeFolderRef.current;
+      if (!targetFolder) return;
+      const updatedFolder: FolderItem = {
+        ...targetFolder,
+        coverSourceFilePath: item.filePath,
+        coverUrl: item.url,
+      };
+      await savePhysicalFolder(updatedFolder, targetFolder.id);
+      await reloadData(true);
+      showToast(t('toast.coverSet', { name: item.name }));
+    },
+    [reloadData, showToast, t]
+  );
 
   // Security & Password Handlers (No disable/reset backdoor)
   const handleSetPassword = async (newHash: string, hint: string) => {
@@ -960,7 +1115,7 @@ export default function App() {
     try {
       await clearAllPhysicalData();
       setActiveFolderId(null);
-      await reloadData();
+      await reloadData(false, true);
       showToast(t('toast.dataCleared'));
     } finally {
       setBatchStatus(null);
@@ -1148,12 +1303,13 @@ export default function App() {
             </div>
           )}
 
-          {/* Scrollable Media/Folder Grid Viewport */}
+          {/* Scrollable Media/Folder Grid Viewport (禁用 scroll-smooth，防止与 react-virtuoso 虚拟滚动位置修正产生抖动冲突) */}
           <div
+            ref={setScrollParentEl}
             onDragEnter={handleWindowDragEnter}
             onDragOver={handleWindowDragOver}
             onDrop={handleWindowDrop}
-            className="flex-1 overflow-y-auto p-6 scroll-smooth"
+            className="flex-1 overflow-y-auto p-6"
           >
             {/* VIEW G: GLOBAL SEARCH RESULTS PANEL across entire vault */}
             {isGlobalSearching ? (
@@ -1221,7 +1377,7 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* Matched Physical Media Items across all Categories & Subfolders */}
+                    {/* Matched Physical Media Items across all Categories & Subfolders (react-virtuoso VirtualMediaGrid) */}
                     {globalMatchedMedia.length > 0 && (
                       <div className="space-y-3">
                         <div className="flex items-center justify-between">
@@ -1232,46 +1388,42 @@ export default function App() {
                             </span>
                           </h4>
                         </div>
-                        <div className={`grid ${gridClasses}`}>
-                          {globalMatchedMedia.map((item) => {
+                        <VirtualMediaGrid
+                          items={globalMatchedMedia}
+                          viewMode={viewMode}
+                          selectedMediaIds={selectedMediaIds}
+                          scrollParent={scrollParentEl}
+                          onToggleSelect={handleToggleSelectMedia}
+                          onBatchSelectIds={handleBatchSelectMedia}
+                          onOpenLightbox={handleOpenLightbox}
+                          onCopyItem={handleCopySingleItem}
+                          onDeleteItem={handleDeleteMediaItem}
+                          onSetAsFolderCover={handleSetAsFolderCover}
+                          onContextMenuItem={handleMediaContextMenu}
+                          onNativeDragStart={handleNativeDragOutMedia}
+                          renderItemFooter={(item) => {
                             const parentFolder = folders.find((f) => f.id === item.folderId);
+                            if (!parentFolder) return null;
                             const parentSec = categories.find((c) => c.id === item.sectionId);
                             const secName = parentSec ? getSectionText(parentSec).name : item.sectionId;
-                            const folName = parentFolder ? getFolderDisplay(parentFolder).name : '';
+                            const folName = getFolderDisplay(parentFolder).name;
                             const locationLabel = t('globalSearch.locateFolder', {
                               section: secName,
                               folder: folName,
                             });
-
                             return (
-                              <VirtualGridCell key={item.id} estimatedHeight={240}>
-                                <div className="flex flex-col gap-1">
-                                  <MediaCard
-                                    item={item}
-                                    isSelected={selectedMediaIds.has(item.id)}
-                                    onToggleSelect={handleToggleSelectMedia}
-                                    onOpenLightbox={(m) => setLightboxItemId(m.id)}
-                                    onCopyItem={handleCopySingleItem}
-                                    onDeleteItem={handleDeleteMediaItem}
-                                    onSetAsFolderCover={handleSetAsFolderCover}
-                                    onContextMenuItem={handleMediaContextMenu}
-                                  />
-                                  {parentFolder && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleOpenFolder(parentFolder)}
-                                      className="px-2 py-1 rounded-md bg-white/80 dark:bg-slate-900/80 hover:bg-sky-50 dark:hover:bg-slate-800 border border-slate-200/80 dark:border-slate-800 text-[10px] text-slate-500 dark:text-slate-400 hover:text-sky-600 dark:hover:text-sky-400 flex items-center justify-between gap-1 truncate transition-colors cursor-pointer"
-                                      title={locationLabel}
-                                    >
-                                      <span className="truncate font-mono">{locationLabel}</span>
-                                      <span className="text-sky-500 font-sans shrink-0">→</span>
-                                    </button>
-                                  )}
-                                </div>
-                              </VirtualGridCell>
+                              <button
+                                type="button"
+                                onClick={() => handleOpenFolder(parentFolder)}
+                                className="px-2 py-1 rounded-md bg-white/80 dark:bg-slate-900/80 hover:bg-sky-50 dark:hover:bg-slate-800 border border-slate-200/80 dark:border-slate-800 text-[10px] text-slate-500 dark:text-slate-400 hover:text-sky-600 dark:hover:text-sky-400 flex items-center justify-between gap-1 truncate transition-colors cursor-pointer"
+                                title={locationLabel}
+                              >
+                                <span className="truncate font-mono">{locationLabel}</span>
+                                <span className="text-sky-500 font-sans shrink-0">→</span>
+                              </button>
                             );
-                          })}
-                        </div>
+                          }}
+                        />
                       </div>
                     )}
                   </>
@@ -1279,7 +1431,7 @@ export default function App() {
               </div>
             ) : (
               <>
-                {/* VIEW A: Browsing Folders in Current Section (Virtualized Grid) */}
+                {/* VIEW A: Browsing Folders in Current Section */}
                 {!activeFolder && (
                   <div className="space-y-4">
                     {sectionFolders.length === 0 ? (
@@ -1348,7 +1500,7 @@ export default function App() {
                   </div>
                 )}
 
-                {/* VIEW B: Browsing Media inside a Folder (Virtualized Grid + Hover-to-Mount Video) */}
+                {/* VIEW B: Browsing Media inside a Folder (react-virtuoso VirtualMediaGrid + Disk Cache + Hover-to-Mount Video) */}
                 {activeFolder && (
                   <div className="space-y-4">
                     {displayMedia.length === 0 ? (
@@ -1381,22 +1533,20 @@ export default function App() {
                         </div>
                       </div>
                     ) : (
-                      <div className={`grid ${gridClasses}`}>
-                        {displayMedia.map((item) => (
-                          <VirtualGridCell key={item.id} estimatedHeight={210}>
-                            <MediaCard
-                              item={item}
-                              isSelected={selectedMediaIds.has(item.id)}
-                              onToggleSelect={handleToggleSelectMedia}
-                              onOpenLightbox={(m) => setLightboxItemId(m.id)}
-                              onCopyItem={handleCopySingleItem}
-                              onDeleteItem={handleDeleteMediaItem}
-                              onSetAsFolderCover={handleSetAsFolderCover}
-                              onContextMenuItem={handleMediaContextMenu}
-                            />
-                          </VirtualGridCell>
-                        ))}
-                      </div>
+                      <VirtualMediaGrid
+                        items={displayMedia}
+                        viewMode={viewMode}
+                        selectedMediaIds={selectedMediaIds}
+                        scrollParent={scrollParentEl}
+                        onToggleSelect={handleToggleSelectMedia}
+                        onBatchSelectIds={handleBatchSelectMedia}
+                        onOpenLightbox={handleOpenLightbox}
+                        onCopyItem={handleCopySingleItem}
+                        onDeleteItem={handleDeleteMediaItem}
+                        onSetAsFolderCover={handleSetAsFolderCover}
+                        onContextMenuItem={handleMediaContextMenu}
+                        onNativeDragStart={handleNativeDragOutMedia}
+                      />
                     )}
                   </div>
                 )}
@@ -1414,29 +1564,46 @@ export default function App() {
         </main>
       </div>
 
-      {/* Custom React Right-Click Context Menu for Media Cards */}
+      {/* Custom React Right-Click Context Menu for Media Cards (Supports Single & Multi-Select Linked Batch Operations) */}
       {mediaCtxMenu && (
         <div
           style={{ top: mediaCtxMenu.y, left: mediaCtxMenu.x }}
-          className="fixed z-50 w-52 bg-white/95 dark:bg-slate-900/95 border border-sky-100 dark:border-slate-700 rounded-xl shadow-2xl py-1.5 text-xs text-slate-700 dark:text-slate-200 backdrop-blur-md animate-in fade-in zoom-in-95 duration-100"
+          className="fixed z-50 w-56 bg-white/95 dark:bg-slate-900/95 border border-sky-100 dark:border-slate-700 rounded-xl shadow-2xl py-1.5 text-xs text-slate-700 dark:text-slate-200 backdrop-blur-md animate-in fade-in zoom-in-95 duration-100"
           onClick={(e) => e.stopPropagation()}
         >
           <div className="px-3 py-1.5 border-b border-slate-100 dark:border-slate-800 mb-1">
-            <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
-              {mediaCtxMenu.item.name}
-            </div>
-            <div className="text-[10px] text-slate-400 font-mono truncate">
-              {mediaCtxMenu.item.dimensions || mediaCtxMenu.item.type.toUpperCase()}
-            </div>
+            {mediaCtxMenu.targetItems.length > 1 ? (
+              <>
+                <div className="font-semibold text-sky-600 dark:text-sky-400 truncate">
+                  {t('mediaCtx.selectedHeader', { count: mediaCtxMenu.targetItems.length })}
+                </div>
+                <div className="text-[10px] text-slate-400 font-mono truncate">
+                  {mediaCtxMenu.item.name}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                  {mediaCtxMenu.item.name}
+                </div>
+                <div className="text-[10px] text-slate-400 font-mono truncate">
+                  {mediaCtxMenu.item.dimensions || mediaCtxMenu.item.type.toUpperCase()}
+                </div>
+              </>
+            )}
           </div>
 
           <button
             type="button"
-            onClick={() => handleOpenRenameMediaModal(mediaCtxMenu.item)}
+            onClick={() => handleOpenRenameMediaModal(mediaCtxMenu.targetItems)}
             className="w-full px-3 py-2 text-left flex items-center gap-2.5 hover:bg-sky-50 dark:hover:bg-slate-800 hover:text-sky-600 dark:hover:text-sky-400 transition-colors cursor-pointer"
           >
             <Edit3 className="w-3.5 h-3.5 text-sky-500" />
-            <span>{t('mediaCtx.rename')}</span>
+            <span>
+              {mediaCtxMenu.targetItems.length > 1
+                ? t('mediaCtx.batchRename', { count: mediaCtxMenu.targetItems.length })
+                : t('mediaCtx.rename')}
+            </span>
           </button>
 
           <button
@@ -1454,14 +1621,18 @@ export default function App() {
 
           <button
             type="button"
-            onClick={() => handleOpenMoveMediaModal(mediaCtxMenu.item)}
+            onClick={() => handleOpenMoveMediaModal(mediaCtxMenu.targetItems)}
             className="w-full px-3 py-2 text-left flex items-center gap-2.5 hover:bg-sky-50 dark:hover:bg-slate-800 hover:text-sky-600 dark:hover:text-sky-400 transition-colors cursor-pointer"
           >
             <FolderInput className="w-3.5 h-3.5 text-sky-500" />
-            <span>{t('mediaCtx.moveTo')}</span>
+            <span>
+              {mediaCtxMenu.targetItems.length > 1
+                ? t('mediaCtx.batchMoveTo', { count: mediaCtxMenu.targetItems.length })
+                : t('mediaCtx.moveTo')}
+            </span>
           </button>
 
-          {mediaCtxMenu.item.type === 'image' && (
+          {mediaCtxMenu.targetItems.length === 1 && mediaCtxMenu.item.type === 'image' && (
             <button
               type="button"
               onClick={() => {
@@ -1481,14 +1652,22 @@ export default function App() {
           <button
             type="button"
             onClick={() => {
-              const targetId = mediaCtxMenu.item.id;
+              const targets = mediaCtxMenu.targetItems;
               setMediaCtxMenu(null);
-              handleDeleteMediaItem(targetId);
+              if (targets.length > 1) {
+                handleBatchDelete();
+              } else {
+                handleDeleteMediaItem(targets[0].id);
+              }
             }}
             className="w-full px-3 py-2 text-left flex items-center gap-2.5 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/50 transition-colors cursor-pointer"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            <span>{t('mediaCtx.delete')}</span>
+            <span>
+              {mediaCtxMenu.targetItems.length > 1
+                ? t('mediaCtx.batchDelete', { count: mediaCtxMenu.targetItems.length })
+                : t('mediaCtx.delete')}
+            </span>
           </button>
         </div>
       )}
@@ -1611,11 +1790,11 @@ export default function App() {
         </div>
       )}
 
-      {/* Rename Media Item Modal (fs.renameSync) */}
-      {renamingMediaItem && (
+      {/* Rename Media Item(s) Modal (Single Rename or Batch Sequential BaseName_01, BaseName_02...) */}
+      {renamingMediaItems.length > 0 && (
         <div
           className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 select-none animate-in fade-in duration-150"
-          onClick={() => setRenamingMediaItem(null)}
+          onClick={() => setRenamingMediaItems([])}
         >
           <div
             className="w-full max-w-md bg-white dark:bg-slate-900 border border-sky-100 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden"
@@ -1624,15 +1803,19 @@ export default function App() {
             <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
               <div>
                 <h3 className="font-bold text-slate-900 dark:text-slate-100 text-base">
-                  {t('mediaRenameModal.title')}
+                  {renamingMediaItems.length > 1
+                    ? t('mediaRenameModal.batchTitle', { count: renamingMediaItems.length })
+                    : t('mediaRenameModal.title')}
                 </h3>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  {t('mediaRenameModal.subtitle')}
+                  {renamingMediaItems.length > 1
+                    ? t('mediaRenameModal.batchSubtitle')
+                    : t('mediaRenameModal.subtitle')}
                 </p>
               </div>
               <button
                 type="button"
-                onClick={() => setRenamingMediaItem(null)}
+                onClick={() => setRenamingMediaItems([])}
                 className="p-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
@@ -1641,7 +1824,9 @@ export default function App() {
             <form onSubmit={handleSubmitRenameMedia} className="p-6 space-y-4">
               <div>
                 <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                  {t('mediaRenameModal.label')}
+                  {renamingMediaItems.length > 1
+                    ? t('mediaRenameModal.baseNameLabel')
+                    : t('mediaRenameModal.label')}
                 </label>
                 <input
                   type="text"
@@ -1649,13 +1834,27 @@ export default function App() {
                   autoFocus
                   value={renameMediaInput}
                   onChange={(e) => setRenameMediaInput(e.target.value)}
+                  placeholder={
+                    renamingMediaItems.length > 1
+                      ? t('mediaRenameModal.baseNamePlaceholder')
+                      : undefined
+                  }
                   className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:border-sky-500 rounded-lg px-3 py-2 text-xs font-mono text-slate-800 dark:text-slate-100 outline-none focus:ring-2 focus:ring-sky-100 dark:focus:ring-sky-900/50"
                 />
+                {renamingMediaItems.length > 1 && renameMediaInput.trim() && (
+                  <p className="text-[11px] font-mono text-sky-600 dark:text-sky-400 mt-2 bg-sky-50/70 dark:bg-slate-800/70 px-2.5 py-1.5 rounded-md border border-sky-100 dark:border-slate-700">
+                    {t('mediaRenameModal.previewHint', {
+                      preview: renameMediaInput.trim().replace(/\.[^/.]+$/, ''),
+                      ext: (renamingMediaItems[0]?.name.match(/\.[^/.]+$/) || ['.mp4'])[0],
+                      count: renamingMediaItems.length,
+                    })}
+                  </p>
+                )}
               </div>
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setRenamingMediaItem(null)}
+                  onClick={() => setRenamingMediaItems([])}
                   className="px-4 py-2 rounded-lg text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
                 >
                   {t('mediaRenameModal.cancel')}
@@ -1665,7 +1864,9 @@ export default function App() {
                   disabled={isRenamingMedia || !renameMediaInput.trim()}
                   className="px-5 py-2 rounded-lg text-xs font-medium bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white transition-colors shadow-sm shadow-sky-500/20"
                 >
-                  {t('mediaRenameModal.confirm')}
+                  {renamingMediaItems.length > 1
+                    ? t('mediaRenameModal.batchConfirm', { count: renamingMediaItems.length })
+                    : t('mediaRenameModal.confirm')}
                 </button>
               </div>
             </form>
@@ -1673,11 +1874,11 @@ export default function App() {
         </div>
       )}
 
-      {/* Move Media Item Modal (Select Target Media Directory & Subfolder) */}
-      {movingMediaItem && (
+      {/* Move Media Item(s) Modal (Supports Single & Multi-Select Batch Move Across Directories) */}
+      {movingMediaItems.length > 0 && (
         <div
           className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 select-none animate-in fade-in duration-150"
-          onClick={() => setMovingMediaItem(null)}
+          onClick={() => setMovingMediaItems([])}
         >
           <div
             className="w-full max-w-lg bg-white dark:bg-slate-900 border border-sky-100 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden"
@@ -1686,15 +1887,19 @@ export default function App() {
             <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
               <div>
                 <h3 className="font-bold text-slate-900 dark:text-slate-100 text-base">
-                  {t('mediaMoveModal.title')}
+                  {movingMediaItems.length > 1
+                    ? t('mediaMoveModal.batchTitle', { count: movingMediaItems.length })
+                    : t('mediaMoveModal.title')}
                 </h3>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  {t('mediaMoveModal.subtitle', { name: movingMediaItem.name })}
+                  {movingMediaItems.length > 1
+                    ? t('mediaMoveModal.batchSubtitle', { count: movingMediaItems.length })
+                    : t('mediaMoveModal.subtitle', { name: movingMediaItems[0]?.name || '' })}
                 </p>
               </div>
               <button
                 type="button"
-                onClick={() => setMovingMediaItem(null)}
+                onClick={() => setMovingMediaItems([])}
                 className="p-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
@@ -1764,7 +1969,7 @@ export default function App() {
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setMovingMediaItem(null)}
+                  onClick={() => setMovingMediaItems([])}
                   className="px-4 py-2 rounded-lg text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
                 >
                   {t('mediaMoveModal.cancel')}
@@ -1774,7 +1979,9 @@ export default function App() {
                   disabled={isMovingMedia || !targetMoveCategoryId}
                   className="px-5 py-2 rounded-lg text-xs font-medium bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white transition-colors shadow-sm shadow-sky-500/20"
                 >
-                  {t('mediaMoveModal.confirm')}
+                  {movingMediaItems.length > 1
+                    ? t('mediaMoveModal.batchConfirm', { count: movingMediaItems.length })
+                    : t('mediaMoveModal.confirm')}
                 </button>
               </div>
             </form>
@@ -1948,6 +2155,7 @@ export default function App() {
           onUpdateSecurity={handleSetPassword}
           onClearAllData={handleClearAllData}
           onLoadDemoPack={handleLoadDemoPack}
+          onThumbnailCacheChanged={() => reloadData(true)}
         />
       )}
     </div>

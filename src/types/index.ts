@@ -44,6 +44,8 @@ export interface MediaItem {
   filePath?: string;
   type: 'image' | 'video';
   url: string;
+  thumbUrl?: string;
+  mtimeMs?: number;
   size: number;
   sizeFormatted: string;
   dimensions?: string;

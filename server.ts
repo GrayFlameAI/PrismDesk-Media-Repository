@@ -23,6 +23,40 @@ let vaultWatchVersion = Date.now();
 let serverVaultWatcher: fs.FSWatcher | null = null;
 let serverWatchDebounce: NodeJS.Timeout | null = null;
 
+const DEFAULT_THUMBNAILS_DIR = path.join(DEFAULT_VAULT_ROOT, '.prism_thumbnails');
+
+function getServerThumbnailsDir(rootPath?: string): string {
+  const cfg = readConfig();
+  const dir = cfg.thumbnailCacheDir || path.join(rootPath || cfg.vaultRootPath || DEFAULT_VAULT_ROOT, '.prism_thumbnails');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function getServerThumbnailStats(dirPath: string): { count: number; bytes: number } {
+  let count = 0;
+  let bytes = 0;
+  try {
+    if (dirPath && fs.existsSync(dirPath)) {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith('.jpg')) {
+          count += 1;
+          try {
+            bytes += fs.statSync(path.join(dirPath, e.name)).size;
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+  return { count, bytes };
+}
+
+function computeServerThumbnailHash(filePath: string, mtimeMs: number): string {
+  const normalized = path.resolve(String(filePath || ''));
+  const mtime = Math.floor(Number(mtimeMs) || 0);
+  return crypto.createHash('md5').update(`${normalized}_${mtime}`).digest('hex');
+}
+
 function setupServerVaultWatcher(rootPath: string) {
   if (serverVaultWatcher) {
     try {
@@ -32,17 +66,24 @@ function setupServerVaultWatcher(rootPath: string) {
   }
   if (!rootPath || !fs.existsSync(rootPath)) return;
   try {
-    serverVaultWatcher = fs.watch(rootPath, { recursive: true }, (_event, filename) => {
+    serverVaultWatcher = fs.watch(rootPath, { recursive: true }, (eventType, filename) => {
+      if (eventType && eventType !== 'rename') return;
       if (filename) {
         const str = String(filename);
-        if (str.includes('.prism_meta.json') || str.includes('.prism_categories.json') || str.includes('.prism_trash')) {
+        if (
+          str.includes('.prism_meta.json') ||
+          str.includes('.prism_categories.json') ||
+          str.includes('.prism_trash') ||
+          str.includes('.prism_thumbnails') ||
+          str.includes('_prism_tmp_')
+        ) {
           return;
         }
       }
       if (serverWatchDebounce) clearTimeout(serverWatchDebounce);
       serverWatchDebounce = setTimeout(() => {
         vaultWatchVersion = Date.now();
-      }, 350);
+      }, 1500);
     });
   } catch {}
 }
@@ -135,6 +176,7 @@ const DEFAULT_INITIAL_FOLDERS = [
 
 interface AppConfig {
   vaultRootPath: string;
+  thumbnailCacheDir: string;
   security: {
     isPasswordSet: boolean;
     passwordHash: string;
@@ -148,8 +190,12 @@ function readConfig(): AppConfig {
     if (fs.existsSync(CONFIG_FILE)) {
       const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const sec = raw.security || {};
+      const rootPath = raw.vaultRootPath || '';
       return {
-        vaultRootPath: raw.vaultRootPath || '',
+        vaultRootPath: rootPath,
+        thumbnailCacheDir:
+          raw.thumbnailCacheDir ||
+          path.join(rootPath || DEFAULT_VAULT_ROOT, '.prism_thumbnails'),
         security: {
           isPasswordSet: true,
           passwordHash: sec.passwordHash || DEFAULT_PASSWORD_HASH,
@@ -163,6 +209,7 @@ function readConfig(): AppConfig {
   }
   return {
     vaultRootPath: '',
+    thumbnailCacheDir: DEFAULT_THUMBNAILS_DIR,
     security: {
       isPasswordSet: true,
       passwordHash: DEFAULT_PASSWORD_HASH,
@@ -288,10 +335,10 @@ function getMimeType(filePath: string): string {
 function isMediaFile(fileName: string): { isMedia: boolean; type: 'image' | 'video' } {
   if (fileName.startsWith('.prism_')) return { isMedia: false, type: 'image' };
   const ext = path.extname(fileName).toLowerCase();
-  if (['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.bmp'].includes(ext)) {
+  if (['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.bmp', '.avif'].includes(ext)) {
     return { isMedia: true, type: 'image' };
   }
-  if (['.mp4', '.webm', '.mov', '.mkv'].includes(ext)) {
+  if (['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v', '.flv', '.wmv'].includes(ext)) {
     return { isMedia: true, type: 'video' };
   }
   return { isMedia: false, type: 'image' };
@@ -305,6 +352,7 @@ function scanVault(rootPath: string) {
   const categories = readCategories(rootPath);
   const folders: any[] = [];
   const media: any[] = [];
+  const thumbDir = getServerThumbnailsDir(rootPath);
 
   for (const cat of categories) {
     const secId = cat.id;
@@ -372,7 +420,28 @@ function scanVault(rootPath: string) {
 
         const fullFilePath = path.join(folderPath, f.name);
         const fStat = fs.statSync(fullFilePath);
+        const mtimeMs = Math.floor(fStat.mtimeMs || Date.now());
         const spec = (meta.mediaSpecs && meta.mediaSpecs[f.name]) || {};
+
+        let thumbUrl: string | undefined = undefined;
+        let cachedDuration = spec.durationFormatted;
+        let cachedDimensions = spec.dimensions;
+
+        if (check.type === 'video') {
+          const hash = computeServerThumbnailHash(fullFilePath, mtimeMs);
+          const jpgPath = path.join(thumbDir, `${hash}.jpg`);
+          if (fs.existsSync(jpgPath)) {
+            thumbUrl = `/api/fs/stream?path=${encodeURIComponent(jpgPath)}&t=${mtimeMs}`;
+            const jsonPath = path.join(thumbDir, `${hash}.json`);
+            if (fs.existsSync(jsonPath)) {
+              try {
+                const sidecar = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+                if (sidecar.durationFormatted) cachedDuration = sidecar.durationFormatted;
+                if (sidecar.dimensions) cachedDimensions = sidecar.dimensions;
+              } catch {}
+            }
+          }
+        }
 
         media.push({
           id: `${folderId}::${f.name}`,
@@ -381,12 +450,14 @@ function scanVault(rootPath: string) {
           name: f.name,
           filePath: fullFilePath,
           type: check.type,
-          url: `/api/fs/stream?path=${encodeURIComponent(fullFilePath)}&t=${Math.floor(fStat.mtimeMs)}`,
+          url: `/api/fs/stream?path=${encodeURIComponent(fullFilePath)}&t=${mtimeMs}`,
+          thumbUrl,
+          mtimeMs,
           size: fStat.size,
           sizeFormatted: formatFileSize(fStat.size),
-          dimensions: spec.dimensions || (check.type === 'video' ? '1920 × 1080' : '高清原图'),
-          durationFormatted: spec.durationFormatted || (check.type === 'video' ? '00:15' : undefined),
-          createdAt: spec.createdAt || fStat.mtimeMs || Date.now(),
+          dimensions: cachedDimensions || (check.type === 'video' ? '1920 × 1080' : '高清原图'),
+          durationFormatted: cachedDuration || (check.type === 'video' ? '00:15' : undefined),
+          createdAt: spec.createdAt || mtimeMs,
           tags: spec.tags || [],
         });
       }
@@ -406,8 +477,14 @@ async function startServer() {
     if (cfg.vaultRootPath) {
       setupServerVaultWatcher(cfg.vaultRootPath);
     }
+    const thumbDir = getServerThumbnailsDir(cfg.vaultRootPath);
+    const stats = getServerThumbnailStats(thumbDir);
     res.json({
       ...cfg,
+      thumbnailCacheDir: thumbDir,
+      defaultThumbnailCacheDir: DEFAULT_THUMBNAILS_DIR,
+      thumbnailCacheCount: stats.count,
+      thumbnailCacheBytes: stats.bytes,
       defaultSuggestedPath: DEFAULT_VAULT_ROOT,
       homedir: os.homedir(),
     });
@@ -429,6 +506,78 @@ async function startServer() {
       res.json({ ok: true, vaultRootPath: resolvedPath });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err.message || '无法创建或访问该本地路径' });
+    }
+  });
+
+  app.post('/api/fs/config/thumbnail-dir', async (req, res) => {
+    try {
+      const rawDir = String(req.body.thumbnailCacheDir || '').trim() || DEFAULT_THUMBNAILS_DIR;
+      const resolvedNewDir = path.resolve(rawDir);
+      const cfg = readConfig();
+      const oldDir = getServerThumbnailsDir(cfg.vaultRootPath);
+      await fsp.mkdir(resolvedNewDir, { recursive: true });
+
+      let migratedCount = 0;
+      if (oldDir && fs.existsSync(oldDir) && path.resolve(oldDir) !== resolvedNewDir) {
+        try {
+          const entries = await fsp.readdir(oldDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (!entry.isFile()) continue;
+            if (!entry.name.endsWith('.jpg') && !entry.name.endsWith('.json')) continue;
+            const srcFile = path.join(oldDir, entry.name);
+            const destFile = path.join(resolvedNewDir, entry.name);
+            try {
+              if (!fs.existsSync(destFile)) {
+                await fsp.copyFile(srcFile, destFile);
+              }
+              await fsp.unlink(srcFile);
+              if (entry.name.endsWith('.jpg')) migratedCount += 1;
+            } catch {}
+          }
+        } catch {}
+      }
+
+      cfg.thumbnailCacheDir = resolvedNewDir;
+      writeConfig(cfg);
+      const stats = getServerThumbnailStats(resolvedNewDir);
+
+      res.json({
+        ok: true,
+        thumbnailCacheDir: resolvedNewDir,
+        migratedCount,
+        thumbnailCacheCount: stats.count,
+        thumbnailCacheBytes: stats.bytes,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || '无法设置或迁移缩略图缓存目录' });
+    }
+  });
+
+  app.post('/api/fs/thumbnail/clear', async (_req, res) => {
+    try {
+      const cfg = readConfig();
+      const dir = getServerThumbnailsDir(cfg.vaultRootPath);
+      let deletedCount = 0;
+      if (dir && fs.existsSync(dir)) {
+        const entries = await fsp.readdir(dir, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.isFile() && (e.name.endsWith('.jpg') || e.name.endsWith('.json'))) {
+            try {
+              await fsp.unlink(path.join(dir, e.name));
+              if (e.name.endsWith('.jpg')) deletedCount += 1;
+            } catch {}
+          }
+        }
+      }
+      const stats = getServerThumbnailStats(dir);
+      res.json({
+        ok: true,
+        deletedCount,
+        thumbnailCacheCount: stats.count,
+        thumbnailCacheBytes: stats.bytes,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message });
     }
   });
 
@@ -869,6 +1018,161 @@ async function startServer() {
       res.json({ ok: true, newFilePath, newName: safeNewName });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // 9b. 批量重命名物理媒体文件 (两阶段防碰撞 BaseName_01, BaseName_02...)
+  app.post('/api/fs/media/batch-rename', async (req, res) => {
+    try {
+      const { filePaths, baseName } = req.body;
+      if (!Array.isArray(filePaths) || filePaths.length === 0 || !baseName) {
+        return res.status(400).json({ ok: false, error: '批量重命名参数无效' });
+      }
+
+      const rawBase = sanitizeDirName(String(baseName).trim()).replace(/\.[^/.]+$/, '') || '未命名';
+      const validPaths = filePaths.filter((p: string) => p && fs.existsSync(p));
+      const padLen = validPaths.length >= 100 ? Math.max(3, String(validPaths.length).length) : 2;
+      const metaUpdatesByDir = new Map<string, Array<{ oldFileName: string; targetFileName: string }>>();
+      const stagedList: Array<{
+        index: number;
+        dir: string;
+        oldFileName: string;
+        origExt: string;
+        tempFilePath: string;
+      }> = [];
+      const batchSessionToken = `_prism_tmp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_`;
+
+      for (let i = 0; i < validPaths.length; i++) {
+        const srcPath = validPaths[i];
+        if (!fs.existsSync(srcPath)) continue;
+
+        const dir = path.dirname(srcPath);
+        const oldFileName = path.basename(srcPath);
+        const origExt = path.extname(oldFileName);
+        const tempFileName = `${batchSessionToken}${i}${origExt}`;
+        const tempFilePath = path.join(dir, tempFileName);
+
+        await fsp.rename(srcPath, tempFilePath);
+        stagedList.push({
+          index: i,
+          dir,
+          oldFileName,
+          origExt,
+          tempFilePath,
+        });
+      }
+
+      let renamedCount = 0;
+      for (const item of stagedList) {
+        const { index, dir, oldFileName, origExt, tempFilePath } = item;
+        const seqStr = String(index + 1).padStart(padLen, '0');
+        let targetFileName = `${rawBase}_${seqStr}${origExt}`;
+        let targetFilePath = path.join(dir, targetFileName);
+
+        let suffixTry = 1;
+        while (fs.existsSync(targetFilePath)) {
+          targetFileName = `${rawBase}_${seqStr}_${suffixTry}${origExt}`;
+          targetFilePath = path.join(dir, targetFileName);
+          suffixTry += 1;
+        }
+
+        await fsp.rename(tempFilePath, targetFilePath);
+
+        if (!metaUpdatesByDir.has(dir)) {
+          metaUpdatesByDir.set(dir, []);
+        }
+        metaUpdatesByDir.get(dir)!.push({ oldFileName, targetFileName });
+        renamedCount += 1;
+      }
+
+      for (const [dir, changes] of metaUpdatesByDir.entries()) {
+        const metaPath = path.join(dir, '.prism_meta.json');
+        if (fs.existsSync(metaPath)) {
+          try {
+            const meta = JSON.parse(await fsp.readFile(metaPath, 'utf-8'));
+            if (meta.mediaSpecs) {
+              const nextSpecs = { ...meta.mediaSpecs };
+              for (const { oldFileName, targetFileName } of changes) {
+                if (meta.mediaSpecs[oldFileName]) {
+                  nextSpecs[targetFileName] = meta.mediaSpecs[oldFileName];
+                  if (oldFileName !== targetFileName) {
+                    delete nextSpecs[oldFileName];
+                  }
+                }
+              }
+              meta.mediaSpecs = nextSpecs;
+              await fsp.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+            }
+          } catch {}
+        }
+      }
+
+      res.json({ ok: true, count: renamedCount });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // 9c. 持久化磁盘缩略图缓存读取与写入 (.prism_thumbnails/<md5>.jpg)
+  app.post('/api/fs/thumbnail/get', async (req, res) => {
+    try {
+      const cfg = readConfig();
+      const { filePath, mtimeMs } = req.body || {};
+      if (!filePath) return res.json({ hit: false });
+      let effectiveMtime = mtimeMs;
+      if (!effectiveMtime && fs.existsSync(filePath)) {
+        effectiveMtime = fs.statSync(filePath).mtimeMs;
+      }
+      const hash = computeServerThumbnailHash(filePath, effectiveMtime);
+      const thumbDir = getServerThumbnailsDir(cfg.vaultRootPath);
+      const jpgPath = path.join(thumbDir, `${hash}.jpg`);
+      if (fs.existsSync(jpgPath)) {
+        let meta: any = {};
+        const jsonPath = path.join(thumbDir, `${hash}.json`);
+        if (fs.existsSync(jsonPath)) {
+          try {
+            meta = JSON.parse(await fsp.readFile(jsonPath, 'utf-8'));
+          } catch {}
+        }
+        return res.json({
+          hit: true,
+          thumbUrl: `/api/fs/stream?path=${encodeURIComponent(jpgPath)}&t=${Math.floor(effectiveMtime || 0)}`,
+          durationFormatted: meta.durationFormatted,
+          dimensions: meta.dimensions,
+        });
+      }
+      res.json({ hit: false });
+    } catch {
+      res.json({ hit: false });
+    }
+  });
+
+  app.post('/api/fs/thumbnail/save', async (req, res) => {
+    try {
+      const cfg = readConfig();
+      const { filePath, mtimeMs, base64Jpeg, durationFormatted, dimensions } = req.body || {};
+      if (!filePath || !base64Jpeg) return res.json({ ok: false });
+      let effectiveMtime = mtimeMs;
+      if (!effectiveMtime && fs.existsSync(filePath)) {
+        effectiveMtime = fs.statSync(filePath).mtimeMs;
+      }
+      const hash = computeServerThumbnailHash(filePath, effectiveMtime);
+      const thumbDir = getServerThumbnailsDir(cfg.vaultRootPath);
+      const jpgPath = path.join(thumbDir, `${hash}.jpg`);
+      const cleanBase64 = base64Jpeg.includes(',') ? base64Jpeg.split(',')[1] : base64Jpeg;
+      await fsp.writeFile(jpgPath, Buffer.from(cleanBase64, 'base64'));
+
+      if (durationFormatted || dimensions) {
+        const jsonPath = path.join(thumbDir, `${hash}.json`);
+        await fsp.writeFile(jsonPath, JSON.stringify({ durationFormatted, dimensions }), 'utf-8');
+      }
+
+      res.json({
+        ok: true,
+        thumbUrl: `/api/fs/stream?path=${encodeURIComponent(jpgPath)}&t=${Math.floor(effectiveMtime || 0)}`,
+      });
+    } catch (err: any) {
+      res.json({ ok: false, error: err?.message });
     }
   });
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   X, 
   KeyRound, 
@@ -7,10 +7,22 @@ import {
   HardDrive, 
   Check, 
   FolderOpen,
-  ExternalLink
+  ExternalLink,
+  Image as ImageIcon
 } from 'lucide-react';
 import { SecurityConfig } from '../types';
-import { hashPassword, isElectronEnv, selectNativeDirectoryDialog } from '../utils/storage';
+import { 
+  hashPassword, 
+  isElectronEnv, 
+  selectNativeDirectoryDialog,
+  selectNativeThumbnailCacheDirDialog,
+  setCustomThumbnailCacheDir,
+  clearDiskThumbnailCache,
+  getVaultAppConfig,
+  openVaultRootInExplorer,
+  formatFileSize
+} from '../utils/storage';
+import { clearInMemoryVideoPosterCache } from './MediaCard';
 import { useI18n } from '../locales';
 
 interface SettingsModalProps {
@@ -22,6 +34,7 @@ interface SettingsModalProps {
   onUpdateSecurity: (newHash: string, hint: string) => Promise<void>;
   onClearAllData: () => Promise<void>;
   onLoadDemoPack: () => Promise<void>;
+  onThumbnailCacheChanged?: () => Promise<void>;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -33,10 +46,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onUpdateSecurity,
   onClearAllData,
   onLoadDemoPack,
+  onThumbnailCacheChanged,
 }) => {
   const { t } = useI18n();
   const [rootInput, setRootInput] = useState(vaultRootPath);
   const [isUpdatingRoot, setIsUpdatingRoot] = useState(false);
+
+  // Thumbnail Cache Directory State (Task 3: Protect C: Drive)
+  const [thumbCacheDir, setThumbCacheDir] = useState('');
+  const [thumbCacheInput, setThumbCacheInput] = useState('');
+  const [thumbCacheCount, setThumbCacheCount] = useState(0);
+  const [thumbCacheBytes, setThumbCacheBytes] = useState(0);
+  const [isUpdatingThumbDir, setIsUpdatingThumbDir] = useState(false);
+  const [isClearingThumbCache, setIsClearingThumbCache] = useState(false);
 
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -46,6 +68,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const [confirmClear, setConfirmClear] = useState(false);
+
+  useEffect(() => {
+    getVaultAppConfig()
+      .then((cfg) => {
+        setThumbCacheDir(cfg.thumbnailCacheDir || '');
+        setThumbCacheInput(cfg.thumbnailCacheDir || '');
+        setThumbCacheCount(cfg.thumbnailCacheCount || 0);
+        setThumbCacheBytes(cfg.thumbnailCacheBytes || 0);
+      })
+      .catch(() => {});
+  }, []);
 
   const handleBrowseNativeFolder = async () => {
     const picked = await selectNativeDirectoryDialog();
@@ -66,6 +99,86 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setErrorMsg(err?.message || t('settings.rootUpdateError'));
     } finally {
       setIsUpdatingRoot(false);
+    }
+  };
+
+  // Native Dialog Picker for Custom Thumbnail Cache Directory (Auto-migrates existing .jpg files)
+  const handleSelectNativeThumbCacheDir = async () => {
+    setErrorMsg('');
+    setSuccessMsg('');
+    setIsUpdatingThumbDir(true);
+    try {
+      const res = await selectNativeThumbnailCacheDirDialog();
+      if (res && res.ok) {
+        clearInMemoryVideoPosterCache();
+        setThumbCacheDir(res.thumbnailCacheDir);
+        setThumbCacheInput(res.thumbnailCacheDir);
+        setThumbCacheCount(res.thumbnailCacheCount);
+        setThumbCacheBytes(res.thumbnailCacheBytes);
+        setSuccessMsg(
+          t('settings.thumbCacheUpdated', {
+            count: res.migratedCount || 0,
+          })
+        );
+        if (onThumbnailCacheChanged) {
+          await onThumbnailCacheChanged();
+        }
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || t('settings.rootUpdateError'));
+    } finally {
+      setIsUpdatingThumbDir(false);
+    }
+  };
+
+  const handleApplyThumbCacheDir = async () => {
+    if (!thumbCacheInput.trim()) return;
+    setIsUpdatingThumbDir(true);
+    setErrorMsg('');
+    setSuccessMsg('');
+    try {
+      const res = await setCustomThumbnailCacheDir(thumbCacheInput.trim());
+      clearInMemoryVideoPosterCache();
+      setThumbCacheDir(res.thumbnailCacheDir);
+      setThumbCacheInput(res.thumbnailCacheDir);
+      setThumbCacheCount(res.thumbnailCacheCount);
+      setThumbCacheBytes(res.thumbnailCacheBytes);
+      setSuccessMsg(
+        t('settings.thumbCacheUpdated', {
+          count: res.migratedCount || 0,
+        })
+      );
+      if (onThumbnailCacheChanged) {
+        await onThumbnailCacheChanged();
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || t('settings.rootUpdateError'));
+    } finally {
+      setIsUpdatingThumbDir(false);
+    }
+  };
+
+  const handleClearThumbCache = async () => {
+    setIsClearingThumbCache(true);
+    setErrorMsg('');
+    setSuccessMsg('');
+    try {
+      const res = await clearDiskThumbnailCache();
+      clearInMemoryVideoPosterCache();
+      setThumbCacheCount(res.thumbnailCacheCount);
+      setThumbCacheBytes(res.thumbnailCacheBytes);
+      setSuccessMsg(
+        t('settings.thumbCacheCleared', {
+          count: res.deletedCount || 0,
+        })
+      );
+      if (onThumbnailCacheChanged) {
+        await onThumbnailCacheChanged();
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Error');
+    } finally {
+      setIsClearingThumbCache(false);
     }
   };
 
@@ -172,6 +285,75 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 className="px-3.5 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-xs font-medium text-white transition-colors shrink-0 shadow-2xs cursor-pointer"
               >
                 {isUpdatingRoot ? t('settings.applying') : t('settings.applyRoot')}
+              </button>
+            </div>
+          </div>
+
+          {/* 1b. Custom Thumbnail Cache Directory Configuration (Protect C: Drive) */}
+          <div className="space-y-2.5 p-4 rounded-xl bg-sky-50/40 dark:bg-slate-800/40 border border-sky-100 dark:border-slate-700">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-sky-900 dark:text-sky-300">
+                <ImageIcon className="w-4 h-4 text-sky-500 shrink-0" />
+                <span>{t('settings.thumbCacheTitle')}</span>
+              </div>
+              <div className="flex items-center gap-2.5">
+                <span className="text-[11px] font-mono text-sky-700 dark:text-sky-300 bg-sky-100/80 dark:bg-slate-700/80 px-2 py-0.5 rounded-md">
+                  {t('settings.thumbCacheStats', {
+                    count: thumbCacheCount,
+                    size: formatFileSize(thumbCacheBytes),
+                  })}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => openVaultRootInExplorer(thumbCacheDir)}
+                  className="flex items-center gap-1 text-[11px] font-medium text-sky-600 dark:text-sky-400 hover:text-sky-700 dark:hover:text-sky-300 transition-colors shrink-0 cursor-pointer"
+                >
+                  <span>{t('settings.openInExplorer')}</span>
+                  <ExternalLink className="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+              {t('settings.thumbCacheDesc')}
+            </p>
+            <div className="flex items-center gap-2 pt-1 flex-wrap sm:flex-nowrap">
+              <input
+                type="text"
+                value={thumbCacheInput}
+                onChange={(e) => setThumbCacheInput(e.target.value)}
+                placeholder="D:\\PrismDeskThumbnails"
+                className="flex-1 min-w-0 bg-white dark:bg-slate-900 border border-sky-200 dark:border-slate-700 focus:border-sky-500 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-800 dark:text-slate-100 outline-none focus:ring-2 focus:ring-sky-100 dark:focus:ring-sky-900/50"
+              />
+              {isElectronEnv() && (
+                <button
+                  type="button"
+                  onClick={handleSelectNativeThumbCacheDir}
+                  disabled={isUpdatingThumbDir}
+                  className="px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-sky-50 dark:hover:bg-slate-700 text-xs font-medium text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-slate-700 transition-colors flex items-center gap-1 shrink-0 cursor-pointer"
+                >
+                  <FolderOpen className="w-3.5 h-3.5 text-sky-500" />
+                  <span>{t('settings.thumbCacheChangeBtn')}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleApplyThumbCacheDir}
+                disabled={
+                  isUpdatingThumbDir ||
+                  !thumbCacheInput.trim() ||
+                  thumbCacheInput.trim() === thumbCacheDir
+                }
+                className="px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-xs font-medium text-white transition-colors shrink-0 shadow-2xs cursor-pointer"
+              >
+                {isUpdatingThumbDir ? t('settings.applying') : t('settings.thumbCacheApplyBtn')}
+              </button>
+              <button
+                type="button"
+                onClick={handleClearThumbCache}
+                disabled={isClearingThumbCache || thumbCacheCount === 0}
+                className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-rose-50 dark:hover:bg-rose-950/50 disabled:opacity-40 text-xs font-medium text-rose-600 dark:text-rose-400 border border-slate-200 dark:border-slate-700 transition-colors shrink-0 cursor-pointer"
+              >
+                {t('settings.thumbCacheClearBtn')}
               </button>
             </div>
           </div>

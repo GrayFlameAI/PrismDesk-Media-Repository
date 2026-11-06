@@ -57,5 +57,14 @@ if (typeof window !== 'undefined') {
     selectMediaFiles: () => ipcRenderer.invoke('dialog:selectMediaFiles'),
     batchImport: (payload) => ipcRenderer.invoke('fs:batchImport', payload),
     batchTrash: (targetPaths) => ipcRenderer.invoke('fs:batchTrash', targetPaths),
+    batchRenameMedia: (payload) => ipcRenderer.invoke('fs:batchRenameMedia', payload),
+    moveMedia: (payload) => ipcRenderer.invoke('fs:moveMedia', payload),
+    getThumbnail: (payload) => ipcRenderer.invoke('fs:getThumbnail', payload),
+    saveThumbnail: (payload) => ipcRenderer.invoke('fs:saveThumbnail', payload),
+    selectThumbnailCacheDir: () => ipcRenderer.invoke('config:selectThumbnailCacheDir'),
+    setThumbnailCacheDir: (newDir) => ipcRenderer.invoke('config:setThumbnailCacheDir', newDir),
+    clearThumbnailCache: () => ipcRenderer.invoke('fs:clearThumbnailCache'),
+    scanVaultChunked: (payload) => ipcRenderer.invoke('fs:scanVaultChunked', payload),
+    startDrag: (payload) => ipcRenderer.send('fs:startDrag', payload),
   };
 }

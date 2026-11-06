@@ -9,34 +9,36 @@ import {
   Camera
 } from 'lucide-react';
 import { MediaItem } from '../types';
+import { getDiskThumbnail, saveDiskThumbnail, startNativeFileDragOut } from '../utils/storage';
 import { useI18n } from '../locales';
 
 interface MediaCardProps {
   item: MediaItem;
   isSelected: boolean;
+  disableNativeDrag?: boolean;
   onToggleSelect: (id: string) => void;
   onOpenLightbox: (item: MediaItem) => void;
   onCopyItem: (item: MediaItem) => void;
   onDeleteItem: (id: string) => void;
   onSetAsFolderCover?: (item: MediaItem) => void;
   onContextMenuItem?: (e: React.MouseEvent, item: MediaItem) => void;
+  onNativeDragStart?: (item: MediaItem, posterUrl?: string) => void;
 }
 
-interface ExtractedVideoMeta {
-  posterDataUrl: string;
+interface CachedVideoMeta {
+  posterUrl: string;
   durationFormatted?: string;
   dimensions?: string;
 }
 
-// Persistent in-memory cache of lightweight static JPEG Base64 thumbnails (~12KB each)
-const MAX_POSTER_CACHE = 300;
-const videoPosterCache = new Map<string, ExtractedVideoMeta>();
-const inFlightExtractions = new Map<string, Promise<ExtractedVideoMeta | null>>();
+// Lightweight URL cache storing local disk thumbnail file:/// URLs (almost 0 bytes in JS heap)
+const MAX_URL_CACHE = 2000;
+const videoPosterCache = new Map<string, CachedVideoMeta>();
+const inFlightExtractions = new Map<string, Promise<CachedVideoMeta | null>>();
 
-// Concurrency-controlled queue (max 2 offscreen <video> extractors at a time)
-// Ensures 30+ videos never spike memory while generating 1s first-frame thumbnails,
-// and immediately destroys each temporary <video> right after canvas snapshot.
-const MAX_CONCURRENT_EXTRACTIONS = 2;
+// Strictly limit offscreen <video> first-frame extraction concurrency to 1 at a time
+// so CPU stays < 2% and RAM stays < 150MB even in folders with 800+ video files.
+const MAX_CONCURRENT_EXTRACTIONS = 1;
 let activeExtractions = 0;
 const extractionQueue: Array<() => void> = [];
 
@@ -50,6 +52,13 @@ function runNextExtraction() {
   }
 }
 
+function getMediaCacheKey(item: MediaItem): string {
+  if (item.filePath) {
+    return `${item.filePath}_${Math.floor(item.mtimeMs || 0)}`;
+  }
+  return item.url;
+}
+
 function formatDurationSeconds(sec: number): string {
   if (!Number.isFinite(sec) || sec <= 0) return '00:15';
   const totalSec = Math.max(1, Math.round(sec));
@@ -58,143 +67,200 @@ function formatDurationSeconds(sec: number): string {
   return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
 }
 
-function extractVideoFirstFrameThumbnail(
-  cacheKey: string,
-  videoUrl: string
-): Promise<ExtractedVideoMeta | null> {
+export function clearInMemoryVideoPosterCache(): void {
+  videoPosterCache.clear();
+}
+
+function rememberInUrlCache(key: string, meta: CachedVideoMeta) {
+  if (videoPosterCache.size >= MAX_URL_CACHE) {
+    const oldestKey = videoPosterCache.keys().next().value;
+    if (oldestKey) videoPosterCache.delete(oldestKey);
+  }
+  videoPosterCache.set(key, meta);
+}
+
+/**
+ * Resolves a video's thumbnail using the Main Process Persistent Disk Cache (AppData/PrismDesk/thumbnails/<md5>.jpg) first.
+ * Only if no disk cache exists for (filePath + mtimeMs), extracts the 1st-second frame via a single-concurrency offscreen
+ * <video> + <canvas>, writes the tiny .jpg to disk, and immediately destroys the temporary <video>.
+ */
+function resolveOrExtractVideoThumbnail(item: MediaItem): Promise<CachedVideoMeta | null> {
+  const cacheKey = getMediaCacheKey(item);
   const existing = videoPosterCache.get(cacheKey);
   if (existing) return Promise.resolve(existing);
+
+  if (item.thumbUrl) {
+    const directMeta: CachedVideoMeta = {
+      posterUrl: item.thumbUrl,
+      durationFormatted: item.durationFormatted,
+      dimensions: item.dimensions,
+    };
+    rememberInUrlCache(cacheKey, directMeta);
+    return Promise.resolve(directMeta);
+  }
 
   const pending = inFlightExtractions.get(cacheKey);
   if (pending) return pending;
 
-  const jobPromise = new Promise<ExtractedVideoMeta | null>((resolve) => {
-    const task = () => {
-      let tempVideo: HTMLVideoElement | null = document.createElement('video');
-      let settled = false;
-      let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
-      const cleanupAndRelease = () => {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-          timeoutId = null;
-        }
-        if (tempVideo) {
-          try {
-            tempVideo.onloadedmetadata = null;
-            tempVideo.onseeked = null;
-            tempVideo.onloadeddata = null;
-            tempVideo.onerror = null;
-            tempVideo.pause();
-            tempVideo.removeAttribute('src');
-            tempVideo.src = '';
-            tempVideo.load();
-          } catch {}
-          tempVideo = null;
-        }
-      };
-
-      const finish = (result: ExtractedVideoMeta | null) => {
-        if (settled) return;
-        settled = true;
-        cleanupAndRelease();
+  const jobPromise = (async (): Promise<CachedVideoMeta | null> => {
+    try {
+      // 1. Check persistent disk thumbnail cache in Main Process first
+      const diskHit = await getDiskThumbnail(item);
+      if (diskHit.hit && diskHit.thumbUrl) {
+        const hitMeta: CachedVideoMeta = {
+          posterUrl: diskHit.thumbUrl,
+          durationFormatted: diskHit.durationFormatted || item.durationFormatted,
+          dimensions: diskHit.dimensions || item.dimensions,
+        };
+        rememberInUrlCache(cacheKey, hitMeta);
         inFlightExtractions.delete(cacheKey);
-        activeExtractions = Math.max(0, activeExtractions - 1);
-        runNextExtraction();
-        resolve(result);
-      };
+        return hitMeta;
+      }
+    } catch {}
 
-      const captureCanvasSnapshot = () => {
-        if (!tempVideo || settled) return;
-        try {
-          const vw = tempVideo.videoWidth || 640;
-          const vh = tempVideo.videoHeight || 360;
-          const targetW = 384;
-          const targetH = Math.max(180, Math.round((targetW * vh) / vw));
+    // 2. Disk cache miss: enqueue single-concurrency 1s frame capture & persist to disk
+    return new Promise<CachedVideoMeta | null>((resolve) => {
+      const task = () => {
+        let tempVideo: HTMLVideoElement | null = document.createElement('video');
+        let settled = false;
+        let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-          const canvas = document.createElement('canvas');
-          canvas.width = targetW;
-          canvas.height = targetH;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            finish(null);
-            return;
+        const cleanupAndRelease = () => {
+          if (timeoutId) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
           }
-          ctx.drawImage(tempVideo, 0, 0, targetW, targetH);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.74);
-          if (dataUrl && dataUrl.startsWith('data:image/jpeg')) {
-            const meta: ExtractedVideoMeta = {
-              posterDataUrl: dataUrl,
-              durationFormatted: tempVideo.duration
-                ? formatDurationSeconds(tempVideo.duration)
-                : undefined,
-              dimensions:
-                tempVideo.videoWidth && tempVideo.videoHeight
-                  ? `${tempVideo.videoWidth} × ${tempVideo.videoHeight}`
-                  : undefined,
-            };
-            if (videoPosterCache.size >= MAX_POSTER_CACHE) {
-              const oldestKey = videoPosterCache.keys().next().value;
-              if (oldestKey) videoPosterCache.delete(oldestKey);
-            }
-            videoPosterCache.set(cacheKey, meta);
-            finish(meta);
-            return;
+          if (tempVideo) {
+            try {
+              tempVideo.onloadedmetadata = null;
+              tempVideo.onseeked = null;
+              tempVideo.onloadeddata = null;
+              tempVideo.onerror = null;
+              tempVideo.pause();
+              tempVideo.removeAttribute('src');
+              tempVideo.src = '';
+              tempVideo.load();
+            } catch {}
+            tempVideo = null;
           }
-        } catch {}
-        finish(null);
-      };
+        };
 
-      timeoutId = setTimeout(() => {
-        if (!settled && tempVideo && tempVideo.readyState >= 2) {
-          captureCanvasSnapshot();
-        } else {
-          finish(null);
-        }
-      }, 4000);
+        const finish = (result: CachedVideoMeta | null) => {
+          if (settled) return;
+          settled = true;
+          cleanupAndRelease();
+          inFlightExtractions.delete(cacheKey);
+          activeExtractions = Math.max(0, activeExtractions - 1);
+          runNextExtraction();
+          resolve(result);
+        };
 
-      try {
-        tempVideo.muted = true;
-        tempVideo.playsInline = true;
-        tempVideo.preload = 'metadata';
-        tempVideo.crossOrigin = 'anonymous';
-
-        tempVideo.onloadedmetadata = () => {
+        const captureCanvasSnapshot = () => {
           if (!tempVideo || settled) return;
           try {
-            // Seek to 1.0 second (or 25% of duration if clip is shorter than 1.2s)
-            const dur = Number.isFinite(tempVideo.duration) ? tempVideo.duration : 0;
-            const targetTime = dur > 1.2 ? 1.0 : dur > 0.1 ? dur * 0.25 : 0.1;
-            tempVideo.currentTime = targetTime;
-          } catch {
-            captureCanvasSnapshot();
-          }
-        };
+            const vw = tempVideo.videoWidth || 640;
+            const vh = tempVideo.videoHeight || 360;
+            const targetW = 360;
+            const targetH = Math.max(180, Math.round((targetW * vh) / vw));
 
-        tempVideo.onseeked = () => {
-          captureCanvasSnapshot();
-        };
+            const canvas = document.createElement('canvas');
+            canvas.width = targetW;
+            canvas.height = targetH;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+              finish(null);
+              return;
+            }
+            ctx.drawImage(tempVideo, 0, 0, targetW, targetH);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+            const durationFormatted = tempVideo.duration
+              ? formatDurationSeconds(tempVideo.duration)
+              : undefined;
+            const dimensions =
+              tempVideo.videoWidth && tempVideo.videoHeight
+                ? `${tempVideo.videoWidth} × ${tempVideo.videoHeight}`
+                : undefined;
 
-        tempVideo.onerror = () => {
+            // Release the <video> decoder immediately before async disk write
+            cleanupAndRelease();
+
+            if (dataUrl && dataUrl.startsWith('data:image/jpeg')) {
+              saveDiskThumbnail(item, dataUrl, durationFormatted, dimensions)
+                .then((diskThumbUrl) => {
+                  const finalUrl = diskThumbUrl || dataUrl;
+                  const meta: CachedVideoMeta = {
+                    posterUrl: finalUrl,
+                    durationFormatted,
+                    dimensions,
+                  };
+                  rememberInUrlCache(cacheKey, meta);
+                  finish(meta);
+                })
+                .catch(() => {
+                  const meta: CachedVideoMeta = {
+                    posterUrl: dataUrl,
+                    durationFormatted,
+                    dimensions,
+                  };
+                  rememberInUrlCache(cacheKey, meta);
+                  finish(meta);
+                });
+              return;
+            }
+          } catch {}
           finish(null);
         };
 
-        tempVideo.src = videoUrl;
-      } catch {
-        finish(null);
-      }
-    };
+        timeoutId = setTimeout(() => {
+          if (!settled && tempVideo && tempVideo.readyState >= 2) {
+            captureCanvasSnapshot();
+          } else {
+            finish(null);
+          }
+        }, 3500);
 
-    extractionQueue.push(task);
-    runNextExtraction();
-  });
+        try {
+          tempVideo.muted = true;
+          tempVideo.playsInline = true;
+          tempVideo.preload = 'metadata';
+          tempVideo.crossOrigin = 'anonymous';
+
+          tempVideo.onloadedmetadata = () => {
+            if (!tempVideo || settled) return;
+            try {
+              const dur = Number.isFinite(tempVideo.duration) ? tempVideo.duration : 0;
+              const targetTime = dur > 1.2 ? 1.0 : dur > 0.1 ? dur * 0.25 : 0.1;
+              tempVideo.currentTime = targetTime;
+            } catch {
+              captureCanvasSnapshot();
+            }
+          };
+
+          tempVideo.onseeked = () => {
+            captureCanvasSnapshot();
+          };
+
+          tempVideo.onerror = () => {
+            finish(null);
+          };
+
+          tempVideo.src = item.url;
+        } catch {
+          finish(null);
+        }
+      };
+
+      extractionQueue.push(task);
+      runNextExtraction();
+    });
+  })();
 
   inFlightExtractions.set(cacheKey, jobPromise);
   return jobPromise;
 }
 
 /**
- * Fallback placeholder SVG shown only during the brief moment while the 1st-second frame is being extracted
+ * Lightweight SVG placeholder shown before IntersectionObserver triggers or while 1st-second frame is being cached
  */
 function buildStaticVideoPlaceholderSvg(name: string, dimensions?: string): string {
   const safeTitle = (name || 'Video')
@@ -217,23 +283,41 @@ function buildStaticVideoPlaceholderSvg(name: string, dimensions?: string): stri
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
-export const MediaCard: React.FC<MediaCardProps> = ({
+const MediaCardComponent: React.FC<MediaCardProps> = ({
   item,
   isSelected,
+  disableNativeDrag = false,
   onToggleSelect,
   onOpenLightbox,
   onCopyItem,
   onDeleteItem,
   onSetAsFolderCover,
   onContextMenuItem,
+  onNativeDragStart,
 }) => {
   const { t } = useI18n();
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const cacheKey = useMemo(() => getMediaCacheKey(item), [item]);
+
   const [isHovered, setIsHovered] = useState(false);
   // Hover-to-Mount state: <video> is ONLY mounted in DOM when hovered, and immediately destroyed on mouse leave
   const [isVideoMounted, setIsVideoMounted] = useState(false);
-  const [extractedMeta, setExtractedMeta] = useState<ExtractedVideoMeta | null>(
-    () => videoPosterCache.get(item.url) || null
-  );
+  // IntersectionObserver Lazy Loading state: only request thumbnail / image when card enters viewport
+  const [isNearViewport, setIsNearViewport] = useState<boolean>(() => {
+    return Boolean(item.thumbUrl || videoPosterCache.has(cacheKey));
+  });
+  const [extractedMeta, setExtractedMeta] = useState<CachedVideoMeta | null>(() => {
+    const mem = videoPosterCache.get(cacheKey);
+    if (mem) return mem;
+    if (item.thumbUrl) {
+      return {
+        posterUrl: item.thumbUrl,
+        durationFormatted: item.durationFormatted,
+        dimensions: item.dimensions,
+      };
+    }
+    return null;
+  });
   const [copiedFeedback, setCopiedFeedback] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -245,17 +329,68 @@ export const MediaCard: React.FC<MediaCardProps> = ({
     return buildStaticVideoPlaceholderSvg(item.name, item.dimensions);
   }, [item.type, item.name, item.dimensions]);
 
-  // Smart First-Frame Thumbnail Extraction on mount (seeks to 1s, captures small Base64 JPEG, and immediately destroys hidden <video>)
+  // 1. IntersectionObserver + 100ms scroll-idle debounce: only request首帧 when card settles in viewport
   useEffect(() => {
-    if (item.type !== 'video' || !item.url) return;
-    const cached = videoPosterCache.get(item.url);
+    if (isNearViewport) return;
+    const el = cardRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') {
+      setIsNearViewport(true);
+      return;
+    }
+
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            if (!settleTimer) {
+              settleTimer = setTimeout(() => {
+                setIsNearViewport(true);
+                observer.disconnect();
+              }, 100);
+            }
+          } else if (settleTimer) {
+            clearTimeout(settleTimer);
+            settleTimer = null;
+          }
+        }
+      },
+      {
+        rootMargin: '220px 0px',
+        threshold: 0.01,
+      }
+    );
+
+    observer.observe(el);
+    return () => {
+      if (settleTimer) clearTimeout(settleTimer);
+      observer.disconnect();
+    };
+  }, [isNearViewport]);
+
+  // 2. Disk-Cached / Smart 1s First-Frame Thumbnail Resolution (only when near viewport)
+  useEffect(() => {
+    if (item.type !== 'video' || !item.url || !isNearViewport) return;
+
+    const cached = videoPosterCache.get(cacheKey);
     if (cached) {
       setExtractedMeta(cached);
       return;
     }
 
+    if (item.thumbUrl) {
+      const preCached: CachedVideoMeta = {
+        posterUrl: item.thumbUrl,
+        durationFormatted: item.durationFormatted,
+        dimensions: item.dimensions,
+      };
+      rememberInUrlCache(cacheKey, preCached);
+      setExtractedMeta(preCached);
+      return;
+    }
+
     let cancelled = false;
-    extractVideoFirstFrameThumbnail(item.url, item.url).then((meta) => {
+    resolveOrExtractVideoThumbnail(item).then((meta) => {
       if (!cancelled && meta) {
         setExtractedMeta(meta);
       }
@@ -264,7 +399,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [item.type, item.url]);
+  }, [item, cacheKey, isNearViewport]);
 
   /**
    * Immediately flushes Chromium's video decoder buffer, clears src="", calls load(),
@@ -296,11 +431,12 @@ export const MediaCard: React.FC<MediaCardProps> = ({
 
   const handleMouseEnter = () => {
     setIsHovered(true);
+    setIsNearViewport(true);
     if (item.type === 'video') {
       if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
       hoverTimerRef.current = setTimeout(() => {
         setIsVideoMounted(true);
-      }, 45);
+      }, 65);
     }
   };
 
@@ -349,12 +485,38 @@ export const MediaCard: React.FC<MediaCardProps> = ({
     }
   };
 
-  const posterImageSrc = extractedMeta?.posterDataUrl || staticFallbackPoster;
+  const posterImageSrc = extractedMeta?.posterUrl || item.thumbUrl || staticFallbackPoster;
   const displayDuration = extractedMeta?.durationFormatted || item.durationFormatted || '00:15';
   const displayDimensions = extractedMeta?.dimensions || item.dimensions || t('mediaCard.hdFormat');
 
+  /**
+   * 任务四：支持“原生文件拖拽到外部应用” (Desktop, PS, PR, 剪映等)
+   * 拦截浏览器默认 HTML5 拖拽，释放视频文件句柄，并通过 IPC 通知主进程调用 event.sender.startDrag
+   */
+  const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+    if (disableNativeDrag) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    setIsHovered(false);
+    if (item.type === 'video') {
+      destroyAndUnmountVideo();
+    }
+    if (onNativeDragStart) {
+      onNativeDragStart(item, posterImageSrc);
+    } else {
+      startNativeFileDragOut(item, undefined, posterImageSrc);
+    }
+  };
+
   return (
     <div
+      ref={cardRef}
+      data-media-id={item.id}
+      draggable={!disableNativeDrag}
+      onDragStart={handleDragStart}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
       onDoubleClick={() => {
@@ -362,12 +524,12 @@ export const MediaCard: React.FC<MediaCardProps> = ({
         onOpenLightbox(item);
       }}
       onContextMenu={handleRightClick}
-      className={`group relative rounded-xl bg-white dark:bg-slate-900 border transition-all duration-300 ease-out select-none cursor-pointer flex flex-col shadow-xs ${
+      className={`group relative rounded-xl bg-white dark:bg-slate-900 border transition-all duration-200 ease-out select-none cursor-pointer flex flex-col shadow-xs ${
         isSelected
           ? 'border-sky-500 ring-2 ring-sky-500/35 bg-sky-50/30 dark:bg-sky-950/30 shadow-md shadow-sky-500/10'
           : 'border-slate-200 dark:border-slate-800 hover:border-sky-400 dark:hover:border-sky-500'
       } ${
-        isHovered
+        isHovered && !disableNativeDrag
           ? 'z-30 scale-115 shadow-2xl shadow-sky-500/25 ring-1 ring-sky-400/50'
           : 'z-10'
       }`}
@@ -375,17 +537,18 @@ export const MediaCard: React.FC<MediaCardProps> = ({
         transformOrigin: 'center center',
       }}
     >
-      {/* Media Thumbnail Container: Static 1s First-Frame Thumbnail + Hover-to-Play <video> */}
-      <div className="relative aspect-video w-full rounded-t-xl overflow-hidden bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
+      {/* 锁定 16:9 比例容器 (aspect-video shrink-0)，确保图片/缩略图异步加载前后高度恒定，杜绝虚拟列表高度坍塌 */}
+      <div className="relative aspect-video w-full shrink-0 rounded-t-xl overflow-hidden bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
         {item.type === 'video' ? (
           <div className="w-full h-full relative">
-            {/* Default State (Unhovered): Pure static <img> displaying the extracted 1st-second frame thumbnail */}
+            {/* Default State (Unhovered): Pure static <img> displaying the disk-cached .jpg thumbnail */}
             <img
               src={posterImageSrc}
               alt={item.name}
+              draggable={false}
               loading="lazy"
               decoding="async"
-              className="w-full h-full object-cover"
+              className="w-full h-full object-cover select-none"
             />
 
             {/* Hover State ONLY: Dynamically mount <video> with poster for seamless zero-flash playback */}
@@ -399,7 +562,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
                 playsInline
                 preload="metadata"
                 onLoadedData={handleVideoLoadedData}
-                className="absolute inset-0 w-full h-full object-cover z-10"
+                className="absolute inset-0 w-full h-full object-cover z-10 pointer-events-none"
               />
             )}
 
@@ -417,19 +580,23 @@ export const MediaCard: React.FC<MediaCardProps> = ({
           </div>
         ) : (
           <div className="w-full h-full relative overflow-hidden">
-            <img
-              src={item.url}
-              alt={item.name}
-              loading="lazy"
-              decoding="async"
-              referrerPolicy="no-referrer"
-              className="w-full h-full object-cover transition-transform duration-500 ease-out group-hover:scale-105"
-            />
+            {isNearViewport && (
+              <img
+                src={item.url}
+                alt={item.name}
+                draggable={false}
+                loading="lazy"
+                decoding="async"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover transition-transform duration-500 ease-out group-hover:scale-105 select-none"
+              />
+            )}
           </div>
         )}
 
         {/* Top-Left Selection Checkbox */}
-        <div 
+        <div
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
             onToggleSelect(item.id);
@@ -446,6 +613,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
 
         {/* Hover Quick Action Buttons Bar */}
         <div
+          onMouseDown={(e) => e.stopPropagation()}
           className={`absolute top-2 right-2 z-30 flex items-center gap-1 transition-opacity duration-200 ${
             isHovered ? 'opacity-100' : 'opacity-0 pointer-events-none'
           }`}
@@ -510,8 +678,8 @@ export const MediaCard: React.FC<MediaCardProps> = ({
         )}
       </div>
 
-      {/* Media Details Footer */}
-      <div className="p-2.5 flex flex-col justify-between bg-white dark:bg-slate-900 rounded-b-xl border-t border-slate-100 dark:border-slate-800 transition-colors">
+      {/* 锁定底部详情栏高度 (h-[58px] shrink-0)，避免字体或长文件名导致卡片高度不一致 */}
+      <div className="p-2.5 h-[58px] shrink-0 flex flex-col justify-between bg-white dark:bg-slate-900 rounded-b-xl border-t border-slate-100 dark:border-slate-800 transition-colors">
         <div className="flex items-start justify-between gap-1">
           <div 
             className="text-xs font-medium text-slate-800 dark:text-slate-100 hover:text-sky-600 dark:hover:text-sky-400 transition-colors truncate"
@@ -522,7 +690,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
         </div>
 
         {/* Clean Typographic Metadata */}
-        <div className="flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 mt-1.5 font-mono tabular-nums">
+        <div className="flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 mt-1 font-mono tabular-nums truncate">
           <span>{displayDimensions}</span>
           <span className="text-slate-300 dark:text-slate-700">·</span>
           <span>{item.sizeFormatted}</span>
@@ -537,3 +705,24 @@ export const MediaCard: React.FC<MediaCardProps> = ({
     </div>
   );
 };
+
+export const MediaCard = React.memo(
+  MediaCardComponent,
+  (prev, next) =>
+    (prev.item === next.item ||
+      (prev.item.id === next.item.id &&
+        prev.item.filePath === next.item.filePath &&
+        prev.item.mtimeMs === next.item.mtimeMs &&
+        prev.item.size === next.item.size &&
+        prev.item.name === next.item.name &&
+        (prev.item.thumbUrl || '') === (next.item.thumbUrl || ''))) &&
+    prev.isSelected === next.isSelected &&
+    prev.disableNativeDrag === next.disableNativeDrag &&
+    prev.onToggleSelect === next.onToggleSelect &&
+    prev.onOpenLightbox === next.onOpenLightbox &&
+    prev.onCopyItem === next.onCopyItem &&
+    prev.onDeleteItem === next.onDeleteItem &&
+    prev.onSetAsFolderCover === next.onSetAsFolderCover &&
+    prev.onContextMenuItem === next.onContextMenuItem &&
+    prev.onNativeDragStart === next.onNativeDragStart
+);

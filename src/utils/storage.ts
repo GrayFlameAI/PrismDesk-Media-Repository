@@ -113,7 +113,20 @@ function toLocalFileUrl(filePath: string, mtimeMs?: number): string {
 export interface VaultAppConfig {
   vaultRootPath: string;
   defaultSuggestedPath: string;
+  thumbnailCacheDir: string;
+  defaultThumbnailCacheDir: string;
+  thumbnailCacheCount: number;
+  thumbnailCacheBytes: number;
   security: SecurityConfig;
+}
+
+export interface ThumbnailCacheMigrationResult {
+  ok: boolean;
+  thumbnailCacheDir: string;
+  migratedCount: number;
+  thumbnailCacheCount: number;
+  thumbnailCacheBytes: number;
+  error?: string;
 }
 
 export async function getVaultAppConfig(): Promise<VaultAppConfig> {
@@ -125,6 +138,10 @@ export async function getVaultAppConfig(): Promise<VaultAppConfig> {
     return {
       vaultRootPath: cfg.vaultRootPath || '',
       defaultSuggestedPath: cfg.defaultSuggestedPath || 'C:\\Users\\Public\\PrismDeskVault',
+      thumbnailCacheDir: cfg.thumbnailCacheDir || '',
+      defaultThumbnailCacheDir: cfg.defaultThumbnailCacheDir || '',
+      thumbnailCacheCount: Number(cfg.thumbnailCacheCount || 0),
+      thumbnailCacheBytes: Number(cfg.thumbnailCacheBytes || 0),
       security: {
         isPasswordSet: true,
         passwordHash: sec.passwordHash || defaultHash,
@@ -140,6 +157,11 @@ export async function getVaultAppConfig(): Promise<VaultAppConfig> {
   return {
     vaultRootPath: data.vaultRootPath || '',
     defaultSuggestedPath: data.defaultSuggestedPath || '/app/applet/PrismDeskVault',
+    thumbnailCacheDir: data.thumbnailCacheDir || '/app/applet/PrismDeskVault/.prism_thumbnails',
+    defaultThumbnailCacheDir:
+      data.defaultThumbnailCacheDir || '/app/applet/PrismDeskVault/.prism_thumbnails',
+    thumbnailCacheCount: Number(data.thumbnailCacheCount || 0),
+    thumbnailCacheBytes: Number(data.thumbnailCacheBytes || 0),
     security: {
       isPasswordSet: true,
       passwordHash: sec.passwordHash || defaultHash,
@@ -179,6 +201,61 @@ export async function selectNativeDirectoryDialog(): Promise<string | null> {
   return null;
 }
 
+export async function selectNativeThumbnailCacheDirDialog(): Promise<ThumbnailCacheMigrationResult | null> {
+  const mods = getNodeModules();
+  if (mods) {
+    const res = await mods.electron.ipcRenderer.invoke('config:selectThumbnailCacheDir');
+    return res || null;
+  }
+  return null;
+}
+
+export async function setCustomThumbnailCacheDir(
+  newDirPath: string
+): Promise<ThumbnailCacheMigrationResult> {
+  const mods = getNodeModules();
+  if (mods) {
+    const res = await mods.electron.ipcRenderer.invoke('config:setThumbnailCacheDir', newDirPath);
+    if (!res || !res.ok) {
+      throw new Error(res?.error || '设置缩略图缓存目录失败');
+    }
+    return res;
+  }
+
+  const res = await fetch('/api/fs/config/thumbnail-dir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thumbnailCacheDir: newDirPath }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || '设置缩略图缓存目录失败');
+  return data;
+}
+
+export async function clearDiskThumbnailCache(): Promise<{
+  deletedCount: number;
+  thumbnailCacheCount: number;
+  thumbnailCacheBytes: number;
+}> {
+  const mods = getNodeModules();
+  if (mods) {
+    const res = await mods.electron.ipcRenderer.invoke('fs:clearThumbnailCache');
+    return {
+      deletedCount: Number(res?.deletedCount || 0),
+      thumbnailCacheCount: Number(res?.thumbnailCacheCount || 0),
+      thumbnailCacheBytes: Number(res?.thumbnailCacheBytes || 0),
+    };
+  }
+
+  const res = await fetch('/api/fs/thumbnail/clear', { method: 'POST' });
+  const data = await res.json();
+  return {
+    deletedCount: Number(data?.deletedCount || 0),
+    thumbnailCacheCount: Number(data?.thumbnailCacheCount || 0),
+    thumbnailCacheBytes: Number(data?.thumbnailCacheBytes || 0),
+  };
+}
+
 export interface NativeSelectedMediaFile {
   sourcePath: string;
   name: string;
@@ -216,13 +293,23 @@ export async function selectNativeMediaFilesDialog(): Promise<NativeSelectedMedi
 }
 
 export function subscribeToVaultFsChanges(onChanged: () => void): () => void {
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  const triggerDebounced = () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      onChanged();
+    }, 1200);
+  };
+
   const mods = getNodeModules();
   if (mods) {
     const handler = () => {
-      onChanged();
+      triggerDebounced();
     };
     mods.electron.ipcRenderer.on('vault:fsChanged', handler);
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       mods.electron.ipcRenderer.removeListener('vault:fsChanged', handler);
     };
   }
@@ -237,12 +324,79 @@ export function subscribeToVaultFsChanges(onChanged: () => void): () => void {
         lastVersion = data.version;
       } else if (data.version && data.version !== lastVersion) {
         lastVersion = data.version;
-        onChanged();
+        triggerDebounced();
       }
     } catch {}
-  }, 2500);
+  }, 3000);
 
-  return () => clearInterval(timer);
+  return () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    clearInterval(timer);
+  };
+}
+
+// ==================== NATIVE OS DRAG-OUT (event.sender.startDrag) ====================
+
+let internalMediaDragUntil = 0;
+
+/**
+ * 标记当前正在执行“从软件向外部系统（桌面/PS/PR）拖拽导出文件”，
+ * 防止触发窗口自身的“拖入导入文件”遮罩层。
+ */
+export function isInternalMediaDragActive(): boolean {
+  return Date.now() < internalMediaDragUntil;
+}
+
+export function clearInternalMediaDragActive(): void {
+  internalMediaDragUntil = 0;
+}
+
+/**
+ * 触发 Electron 主进程原生系统级文件拖出 (event.sender.startDrag)
+ * 支持单文件拖出及多选批量拖出到 Windows 桌面、资源管理器、PS、PR、剪映等外部软件
+ */
+export function startNativeFileDragOut(
+  primaryItem: MediaItem,
+  selectedItems?: MediaItem[],
+  resolvedPosterPath?: string
+): boolean {
+  if (!primaryItem || !primaryItem.filePath) return false;
+
+  internalMediaDragUntil = Date.now() + 2800;
+
+  const batchList =
+    selectedItems && selectedItems.length > 1 && selectedItems.some((m) => m.id === primaryItem.id)
+      ? selectedItems
+      : [primaryItem];
+
+  const filePaths = Array.from(
+    new Set(batchList.map((m) => m.filePath).filter((p): p is string => Boolean(p && p.trim())))
+  );
+  if (filePaths.length === 0) return false;
+
+  const payload = {
+    filePath: primaryItem.filePath,
+    filePaths,
+    iconPath: resolvedPosterPath || primaryItem.thumbUrl || primaryItem.filePath,
+  };
+
+  try {
+    const api = typeof window !== 'undefined' ? (window as any).electronAPI : null;
+    if (api && typeof api.startDrag === 'function') {
+      api.startDrag(payload);
+      return true;
+    }
+  } catch {}
+
+  try {
+    const mods = getNodeModules();
+    if (mods?.electron?.ipcRenderer) {
+      mods.electron.ipcRenderer.send('fs:startDrag', payload);
+      return true;
+    }
+  } catch {}
+
+  return false;
 }
 
 export function subscribeToImportProgress(
@@ -460,9 +614,107 @@ export async function deletePhysicalCategory(id: string): Promise<void> {
   if (!data.ok) throw new Error(data.error || '删除分类失败');
 }
 
-// ==================== PHYSICAL DISK REAL-TIME SCANNING ====================
+// ==================== PHYSICAL DISK REAL-TIME SCANNING (IPC 50-ITEM CHUNKING + IDEMPOTENT DEDUP) ====================
 
-export async function scanPhysicalVault(): Promise<{
+function isSameMediaAsset(a: MediaItem, b: MediaItem): boolean {
+  return (
+    a.id === b.id &&
+    a.filePath === b.filePath &&
+    a.mtimeMs === b.mtimeMs &&
+    a.size === b.size &&
+    a.name === b.name &&
+    a.folderId === b.folderId &&
+    a.sectionId === b.sectionId &&
+    (a.thumbUrl || '') === (b.thumbUrl || '')
+  );
+}
+
+export function deduplicateMediaList(items: MediaItem[]): MediaItem[] {
+  const map = new Map<string, MediaItem>();
+  for (const item of items) {
+    if (!item) continue;
+    const key = item.filePath || item.id;
+    map.set(key, item);
+  }
+  return Array.from(map.values());
+}
+
+/**
+ * 分批流式累加函数式合并：
+ * 1. 严禁在收到第 1 批分片 (isFirst) 时清空已有分类/文件夹的数据，彻底根除“切换或滚动时文件突然消失变空白”的 Bug；
+ * 2. 对未发生属性变化的媒体项严格复用旧对象引用 (prevItem)，避免破坏 React.memo 引发全列表重绘闪烁。
+ */
+export function mergeMediaChunkPreservingRefs(
+  prev: MediaItem[],
+  chunk: MediaItem[]
+): MediaItem[] {
+  if (!Array.isArray(chunk) || chunk.length === 0) return prev;
+  const map = new Map<string, MediaItem>();
+  for (const existing of prev) {
+    if (existing) {
+      map.set(existing.filePath || existing.id, existing);
+    }
+  }
+
+  let hasChanged = false;
+  for (const incoming of chunk) {
+    if (!incoming) continue;
+    const key = incoming.filePath || incoming.id;
+    const oldItem = map.get(key);
+    if (oldItem && isSameMediaAsset(oldItem, incoming)) {
+      // 复用旧引用，保持 React.memo 稳定
+      continue;
+    }
+    map.set(key, incoming);
+    hasChanged = true;
+  }
+
+  return hasChanged ? Array.from(map.values()) : prev;
+}
+
+/**
+ * 全量扫描完成后的幂等引用对账函数：
+ * 1. 对物理路径、修改时间、大小未变的媒体项 100% 复用原对象引用；
+ * 2. 如果数组长度与各项引用完全一致，直接返回原数组引用 `prev`，实现 0 重渲染。
+ */
+export function reconcileMediaListPreservingRefs(
+  prev: MediaItem[],
+  next: MediaItem[]
+): MediaItem[] {
+  const dedupedNext = deduplicateMediaList(next);
+  if (prev.length === 0 && dedupedNext.length === 0) return prev;
+
+  const prevMap = new Map<string, MediaItem>();
+  for (const item of prev) {
+    if (item) {
+      prevMap.set(item.filePath || item.id, item);
+    }
+  }
+
+  let anyDiff = prev.length !== dedupedNext.length;
+  const reconciled: MediaItem[] = new Array(dedupedNext.length);
+
+  for (let i = 0; i < dedupedNext.length; i++) {
+    const incoming = dedupedNext[i];
+    const key = incoming.filePath || incoming.id;
+    const existing = prevMap.get(key);
+    if (existing && isSameMediaAsset(existing, incoming)) {
+      reconciled[i] = existing;
+      if (!anyDiff && prev[i] !== existing) {
+        anyDiff = true;
+      }
+    } else {
+      reconciled[i] = incoming;
+      anyDiff = true;
+    }
+  }
+
+  return anyDiff ? reconciled : prev;
+}
+
+export async function scanPhysicalVault(
+  onMediaChunk?: (chunk: MediaItem[], isFirst: boolean) => void
+): Promise<{
   categories: SectionConfig[];
   folders: FolderItem[];
   allMedia: MediaItem[];
@@ -470,7 +722,7 @@ export async function scanPhysicalVault(): Promise<{
 }> {
   const mods = getNodeModules();
   if (mods) {
-    const { fs, path } = mods;
+    const { fs, path, electron } = mods;
     const cfg = await getVaultAppConfig();
     const rootPath = cfg.vaultRootPath;
     if (!rootPath || !fs.existsSync(rootPath)) {
@@ -478,9 +730,58 @@ export async function scanPhysicalVault(): Promise<{
     }
 
     ensureElectronInitialFolders(rootPath);
+
+    // 优先使用主进程分片流式扫描 (fs:scanVaultChunked，50 条/批 + 唯一 scanId 会话锁 + Map 物理路径幂等去重)
+    try {
+      const scanId = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const collectedMap = new Map<string, MediaItem>();
+
+      const chunkListener = (
+        _event: any,
+        payload: {
+          scanId: string;
+          chunk: MediaItem[];
+          isFirst: boolean;
+          isDone: boolean;
+          total: number;
+        }
+      ) => {
+        if (!payload || payload.scanId !== scanId || !Array.isArray(payload.chunk)) return;
+        if (payload.isFirst) {
+          collectedMap.clear();
+        }
+        for (const m of payload.chunk) {
+          if (m) {
+            collectedMap.set(m.filePath || m.id, m);
+          }
+        }
+        if (onMediaChunk) {
+          // 直接同步传递当前批次，彻底杜绝 requestAnimationFrame 跨帧延迟引发的“250截断”或“重复累加复制体”
+          onMediaChunk(payload.chunk, payload.isFirst);
+        }
+      };
+
+      electron.ipcRenderer.on('vault:mediaChunk', chunkListener);
+      try {
+        const res = await electron.ipcRenderer.invoke('fs:scanVaultChunked', { scanId });
+        if (res && res.ok) {
+          return {
+            categories: res.categories?.length ? res.categories : SECTIONS,
+            folders: res.folders || [],
+            allMedia: Array.from(collectedMap.values()),
+            vaultRootPath: res.vaultRootPath || rootPath,
+          };
+        }
+      } finally {
+        electron.ipcRenderer.removeListener('vault:mediaChunk', chunkListener);
+      }
+    } catch {
+      // Fallback to direct fs scan if main process doesn't have fs:scanVaultChunked registered yet
+    }
+
     const categories = readElectronCategories(rootPath);
     const folders: FolderItem[] = [];
-    const allMedia: MediaItem[] = [];
+    const mediaMap = new Map<string, MediaItem>();
 
     for (const cat of categories) {
       const secId = cat.id;
@@ -547,24 +848,36 @@ export async function scanPhysicalVault(): Promise<{
 
           const fullFilePath = path.join(folderPath, f.name);
           const fStat = fs.statSync(fullFilePath);
+          const mtimeMs = Math.floor(fStat.mtimeMs || Date.now());
           const spec = (meta.mediaSpecs && meta.mediaSpecs[f.name]) || {};
 
-          allMedia.push({
+          const item: MediaItem = {
             id: `${folderId}::${f.name}`,
             folderId,
             sectionId: secId,
             name: f.name,
             filePath: fullFilePath,
             type: check.type,
-            url: toLocalFileUrl(fullFilePath, fStat.mtimeMs),
+            url: toLocalFileUrl(fullFilePath, mtimeMs),
+            mtimeMs,
             size: fStat.size,
             sizeFormatted: formatFileSize(fStat.size),
             dimensions: spec.dimensions || (check.type === 'video' ? '1920 × 1080' : '高清原图'),
             durationFormatted: spec.durationFormatted || (check.type === 'video' ? '00:15' : undefined),
-            createdAt: spec.createdAt || fStat.mtimeMs || Date.now(),
+            createdAt: spec.createdAt || mtimeMs,
             tags: spec.tags || [],
-          });
+          };
+          mediaMap.set(fullFilePath, item);
         }
+      }
+    }
+
+    const allMedia = Array.from(mediaMap.values());
+    if (onMediaChunk && allMedia.length > 0) {
+      const CHUNK_SIZE = 50;
+      for (let i = 0; i < allMedia.length; i += CHUNK_SIZE) {
+        const chunk = allMedia.slice(i, i + CHUNK_SIZE);
+        onMediaChunk(chunk, i === 0);
       }
     }
 
@@ -573,12 +886,125 @@ export async function scanPhysicalVault(): Promise<{
 
   const res = await fetch('/api/fs/scan');
   const data = await res.json();
+  const mediaList: MediaItem[] = deduplicateMediaList(data.media || []);
+
+  if (onMediaChunk && mediaList.length > 0) {
+    const CHUNK_SIZE = 50;
+    for (let i = 0; i < mediaList.length; i += CHUNK_SIZE) {
+      const chunk = mediaList.slice(i, i + CHUNK_SIZE);
+      onMediaChunk(chunk, i === 0);
+    }
+  }
+
   return {
     categories: data.categories || SECTIONS,
     folders: data.folders || [],
-    allMedia: data.media || [],
+    allMedia: mediaList,
     vaultRootPath: data.vaultRootPath || '',
   };
+}
+
+// ==================== PERSISTENT DISK THUMBNAIL CACHE (MD5 path + mtimeMs) ====================
+
+export interface DiskThumbnailResult {
+  hit: boolean;
+  thumbUrl?: string;
+  durationFormatted?: string;
+  dimensions?: string;
+}
+
+export async function getDiskThumbnail(item: MediaItem): Promise<DiskThumbnailResult> {
+  if (item.thumbUrl) {
+    return {
+      hit: true,
+      thumbUrl: item.thumbUrl,
+      durationFormatted: item.durationFormatted,
+      dimensions: item.dimensions,
+    };
+  }
+  if (!item.filePath) return { hit: false };
+
+  const mods = getNodeModules();
+  if (mods) {
+    try {
+      const res = await mods.electron.ipcRenderer.invoke('fs:getThumbnail', {
+        filePath: item.filePath,
+        mtimeMs: item.mtimeMs,
+      });
+      if (res && res.hit && res.thumbUrl) {
+        return {
+          hit: true,
+          thumbUrl: res.thumbUrl,
+          durationFormatted: res.durationFormatted,
+          dimensions: res.dimensions,
+        };
+      }
+    } catch {}
+    return { hit: false };
+  }
+
+  try {
+    const res = await fetch('/api/fs/thumbnail/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath: item.filePath, mtimeMs: item.mtimeMs }),
+    });
+    const data = await res.json();
+    if (data && data.hit && data.thumbUrl) {
+      return {
+        hit: true,
+        thumbUrl: data.thumbUrl,
+        durationFormatted: data.durationFormatted,
+        dimensions: data.dimensions,
+      };
+    }
+  } catch {}
+  return { hit: false };
+}
+
+export async function saveDiskThumbnail(
+  item: MediaItem,
+  base64Jpeg: string,
+  durationFormatted?: string,
+  dimensions?: string
+): Promise<string | null> {
+  if (!item.filePath || !base64Jpeg) return null;
+
+  const mods = getNodeModules();
+  if (mods) {
+    try {
+      const res = await mods.electron.ipcRenderer.invoke('fs:saveThumbnail', {
+        filePath: item.filePath,
+        mtimeMs: item.mtimeMs,
+        base64Jpeg,
+        durationFormatted,
+        dimensions,
+      });
+      if (res && res.ok && res.thumbUrl) {
+        return res.thumbUrl;
+      }
+    } catch {}
+    return null;
+  }
+
+  try {
+    const res = await fetch('/api/fs/thumbnail/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filePath: item.filePath,
+        mtimeMs: item.mtimeMs,
+        base64Jpeg,
+        durationFormatted,
+        dimensions,
+      }),
+    });
+    const data = await res.json();
+    if (data && data.ok && data.thumbUrl) {
+      return data.thumbUrl;
+    }
+  } catch {}
+  return null;
 }
 
 // ==================== SUBFOLDER & .prism_meta.json PERSISTENCE ====================
@@ -817,7 +1243,7 @@ export async function deletePhysicalMediaItems(items: MediaItem[]): Promise<void
   });
 }
 
-// 物理重命名媒体文件 (先释放视频句柄再重命名)
+// 物理重命名单个媒体文件 (先释放视频句柄再重命名)
 export async function renamePhysicalMediaItem(item: MediaItem, newName: string): Promise<void> {
   if (!item.filePath || !newName.trim()) return;
 
@@ -842,7 +1268,38 @@ export async function renamePhysicalMediaItem(item: MediaItem, newName: string):
   if (!data.ok) throw new Error(data.error || '重命名文件失败');
 }
 
-// 跨目录移动物理媒体文件 (先释放视频句柄再移动)
+// 批量顺序重命名多个物理媒体文件 (BaseName_01.ext, BaseName_02.ext...)
+export async function batchRenamePhysicalMediaItems(
+  items: MediaItem[],
+  baseName: string
+): Promise<number> {
+  const filePaths = items.map((i) => i.filePath).filter(Boolean) as string[];
+  const cleanBase = baseName.trim();
+  if (filePaths.length === 0 || !cleanBase) return 0;
+
+  await releaseVideoFileHandles();
+
+  const mods = getNodeModules();
+  if (mods) {
+    const res = await mods.electron.ipcRenderer.invoke('fs:batchRenameMedia', {
+      filePaths,
+      baseName: cleanBase,
+    });
+    if (!res.ok) throw new Error(res.error || '批量重命名文件失败');
+    return res.count || filePaths.length;
+  }
+
+  const res = await fetch('/api/fs/media/batch-rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filePaths, baseName: cleanBase }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || '批量重命名文件失败');
+  return data.count || filePaths.length;
+}
+
+// 跨目录批量移动物理媒体文件 (先释放视频句柄再移动)
 export async function movePhysicalMediaItems(items: MediaItem[], targetFolderId: string): Promise<void> {
   const filePaths = items.map((i) => i.filePath).filter(Boolean) as string[];
   if (filePaths.length === 0 || !targetFolderId.includes('::')) return;

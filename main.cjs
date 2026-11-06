@@ -81,14 +81,20 @@ function getAppConfigPath() {
   return path.join(app.getPath('userData'), 'prismdesk_app_config.json');
 }
 
+function getDefaultThumbnailCacheDir() {
+  return path.join(app.getPath('userData'), 'thumbnails');
+}
+
 function readAppConfig() {
   const cfgPath = getAppConfigPath();
+  const defaultThumbDir = getDefaultThumbnailCacheDir();
   try {
     if (fs.existsSync(cfgPath)) {
       const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
       const sec = parsed.security || {};
       return {
         vaultRootPath: parsed.vaultRootPath || '',
+        thumbnailCacheDir: parsed.thumbnailCacheDir || defaultThumbDir,
         security: {
           isPasswordSet: true,
           passwordHash: sec.passwordHash || DEFAULT_PASSWORD_HASH,
@@ -102,6 +108,7 @@ function readAppConfig() {
   }
   return {
     vaultRootPath: '',
+    thumbnailCacheDir: defaultThumbDir,
     security: {
       isPasswordSet: true,
       passwordHash: DEFAULT_PASSWORD_HASH,
@@ -117,7 +124,7 @@ function writeAppConfig(cfg) {
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf-8');
 }
 
-// ==================== 实时磁盘热加载监听 (fs.watch + 防抖 + 内部操作静默锁) ====================
+// ==================== 实时磁盘热加载监听 (fs.watch 仅响应结构重命名/增删 + 1500ms 防抖 + 内部静默锁) ====================
 function setupVaultWatcher(rootPath) {
   if (vaultWatcher) {
     try {
@@ -129,14 +136,23 @@ function setupVaultWatcher(rootPath) {
   if (!rootPath || !fs.existsSync(rootPath)) return;
 
   try {
-    vaultWatcher = fs.watch(rootPath, { recursive: true }, (_eventType, filename) => {
+    vaultWatcher = fs.watch(rootPath, { recursive: true }, (eventType, filename) => {
       if (internalFsLockCount > 0) return;
+      // 关键防闪烁修复：Windows 下 <video> 读取视频首帧或流播放时会触发 'change' 事件，
+      // 严禁因读取文件触发热重载清空列表，仅在文件新增/删除/重命名 ('rename') 时触发同步
+      if (eventType && eventType !== 'rename') return;
+
       if (filename) {
-        const base = path.basename(String(filename));
+        const strName = String(filename);
+        const base = path.basename(strName);
         if (
           base.startsWith('.prism_') ||
-          String(filename).includes('.prism_trash') ||
+          base.startsWith('_prism_tmp_') ||
+          strName.includes('.prism_trash') ||
+          strName.includes('.prism_thumbnails') ||
+          strName.includes('thumbnails') ||
           base === 'Thumbs.db' ||
+          base === 'desktop.ini' ||
           base === '.DS_Store'
         ) {
           return;
@@ -152,7 +168,7 @@ function setupVaultWatcher(rootPath) {
             filename: filename ? String(filename) : '',
           });
         }
-      }, 450);
+      }, 1500);
     });
   } catch (err) {
     console.error('Failed to setup fs.watch on vaultRootPath:', err);
@@ -325,12 +341,18 @@ ipcMain.handle('window:close', () => {
 ipcMain.handle('config:get', () => {
   const cfg = readAppConfig();
   const defaultSuggestedPath = path.join(os.homedir(), 'Documents', 'PrismDeskVault');
+  const defaultThumbnailCacheDir = getDefaultThumbnailCacheDir();
   if (cfg.vaultRootPath) {
     ensureVaultStructure(cfg.vaultRootPath);
     setupVaultWatcher(cfg.vaultRootPath);
   }
+  const stats = getThumbnailCacheStats(getThumbnailsDir());
   return {
     ...cfg,
+    thumbnailCacheDir: getThumbnailsDir(),
+    defaultThumbnailCacheDir,
+    thumbnailCacheCount: stats.count,
+    thumbnailCacheBytes: stats.bytes,
     defaultSuggestedPath,
   };
 });
@@ -468,6 +490,59 @@ ipcMain.handle('clipboard:copyFileAndPath', (_event, filePath) => {
   } catch (err) {
     clipboard.writeText(filePath);
     return { ok: true, path: filePath };
+  }
+});
+
+// ==================== 原生文件拖拽到外部应用 (Windows 桌面 / PS / PR / 剪映等) ====================
+// 内置轻量级 1x1 PNG 兜底图标 DataURL，防止 Windows 下 nativeImage 为空导致 startDrag 报错
+const FALLBACK_DRAG_ICON_DATA_URL =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAbklEQVR4nO3RsQkAIBAEwZP9l9Z2sYgg4J7ZBL45z8x0A4M7AAMDGxgY2MDAxgYGNjAwsIGBjQ0MbGBgYwMDGxgY2MDAxgYGNjAwsIGBjQ0MbGBgYwMDGxgY2MDAxgYGNjAwsIGBjQ0MbGDgBZYTAcH2n2sAAAAASUVORK5CYII=';
+
+function buildNativeDragIcon(primaryPath, mtimeMs) {
+  try {
+    // 1. 若是视频且存在磁盘缩略图缓存 (.jpg)，优先使用该视频首帧缩略图作为拖拽图标
+    const hash = computeThumbnailHash(primaryPath, mtimeMs || fs.statSync(primaryPath).mtimeMs);
+    const cachedJpg = path.join(getThumbnailsDir(), `${hash}.jpg`);
+    if (fs.existsSync(cachedJpg)) {
+      const thumbImg = nativeImage.createFromPath(cachedJpg);
+      if (!thumbImg.isEmpty()) {
+        return thumbImg.resize({ width: 96 });
+      }
+    }
+
+    // 2. 若本身是图片文件，直接缩放原图作为拖拽预览图标
+    const ext = path.extname(primaryPath).toLowerCase();
+    if (['.jpg', '.jpeg', '.png', '.webp', '.bmp'].includes(ext)) {
+      const fileImg = nativeImage.createFromPath(primaryPath);
+      if (!fileImg.isEmpty()) {
+        return fileImg.resize({ width: 96 });
+      }
+    }
+  } catch {}
+
+  return nativeImage.createFromDataURL(FALLBACK_DRAG_ICON_DATA_URL);
+}
+
+ipcMain.on('fs:startDrag', (event, payload) => {
+  try {
+    const rawPath = typeof payload === 'string' ? payload : payload?.filePath;
+    const rawList = Array.isArray(payload?.filePaths) ? payload.filePaths : rawPath ? [rawPath] : [];
+    const validFiles = rawList
+      .map((p) => (p ? path.normalize(String(p)) : ''))
+      .filter((p) => p && fs.existsSync(p));
+
+    if (validFiles.length === 0) return;
+
+    const primaryFile = validFiles[0];
+    const dragIcon = buildNativeDragIcon(primaryFile, payload?.mtimeMs);
+
+    event.sender.startDrag({
+      file: primaryFile,
+      files: validFiles,
+      icon: dragIcon,
+    });
+  } catch (err) {
+    console.error('Native startDrag failed:', err?.message || err);
   }
 });
 
@@ -760,6 +835,507 @@ ipcMain.handle('fs:moveMedia', async (_event, { filePaths, targetFolderPath }) =
   } finally {
     endInternalFsOp();
   }
+});
+
+// ==================== 核心修复 4: 批量重命名物理媒体文件 (两阶段防碰撞 BaseName_01, BaseName_02...) ====================
+ipcMain.handle('fs:batchRenameMedia', async (_event, { filePaths, baseName }) => {
+  if (!Array.isArray(filePaths) || filePaths.length === 0 || !baseName) {
+    return { ok: false, error: '批量重命名参数无效' };
+  }
+
+  beginInternalFsOp();
+  try {
+    const rawBase = sanitizeName(String(baseName).trim()).replace(/\.[^/.]+$/, '') || '未命名';
+    const validPaths = filePaths.filter((p) => p && fs.existsSync(p));
+    // < 100 项采用两位补零 (01, 02)，>= 100 项自动采用三位或更多位补零 (001, 002)
+    const padLen = validPaths.length >= 100 ? Math.max(3, String(validPaths.length).length) : 2;
+    const metaUpdatesByDir = new Map();
+    const stagedList = [];
+    const batchSessionToken = `_prism_tmp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_`;
+
+    // 第一阶段：先重命名为临时中转文件名，彻底避免选中文件内部新旧名称互相冲突
+    for (let i = 0; i < validPaths.length; i++) {
+      const srcPath = validPaths[i];
+      if (!fs.existsSync(srcPath)) continue;
+      const dir = path.dirname(srcPath);
+      const oldFileName = path.basename(srcPath);
+      const origExt = path.extname(oldFileName);
+      const tempFileName = `${batchSessionToken}${i}${origExt}`;
+      const tempFilePath = path.join(dir, tempFileName);
+
+      for (let attempt = 0; attempt <= 2; attempt++) {
+        try {
+          await fsp.rename(srcPath, tempFilePath);
+          stagedList.push({
+            index: i,
+            dir,
+            oldFileName,
+            origExt,
+            tempFilePath,
+          });
+          break;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        }
+      }
+    }
+
+    // 第二阶段：按顺序从临时文件重命名为最终序号文件 (Name_01.ext, Name_02.ext...)
+    let renamedCount = 0;
+    for (const item of stagedList) {
+      const { index, dir, oldFileName, origExt, tempFilePath } = item;
+      const seqStr = String(index + 1).padStart(padLen, '0');
+      let targetFileName = `${rawBase}_${seqStr}${origExt}`;
+      let targetFilePath = path.join(dir, targetFileName);
+
+      let suffixTry = 1;
+      while (fs.existsSync(targetFilePath)) {
+        targetFileName = `${rawBase}_${seqStr}_${suffixTry}${origExt}`;
+        targetFilePath = path.join(dir, targetFileName);
+        suffixTry += 1;
+      }
+
+      for (let attempt = 0; attempt <= 2; attempt++) {
+        try {
+          await fsp.rename(tempFilePath, targetFilePath);
+          break;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        }
+      }
+
+      if (!metaUpdatesByDir.has(dir)) {
+        metaUpdatesByDir.set(dir, []);
+      }
+      metaUpdatesByDir.get(dir).push({ oldFileName, targetFileName });
+      renamedCount += 1;
+    }
+
+    for (const [dir, changes] of metaUpdatesByDir.entries()) {
+      const metaPath = path.join(dir, '.prism_meta.json');
+      if (fs.existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(await fsp.readFile(metaPath, 'utf-8'));
+          if (meta.mediaSpecs) {
+            const nextSpecs = { ...meta.mediaSpecs };
+            for (const { oldFileName, targetFileName } of changes) {
+              if (meta.mediaSpecs[oldFileName]) {
+                nextSpecs[targetFileName] = meta.mediaSpecs[oldFileName];
+                if (oldFileName !== targetFileName) {
+                  delete nextSpecs[oldFileName];
+                }
+              }
+            }
+            meta.mediaSpecs = nextSpecs;
+            await fsp.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+          }
+        } catch {}
+      }
+    }
+
+    return { ok: true, count: renamedCount };
+  } catch (err) {
+    return { ok: false, error: err?.message || '批量重命名失败' };
+  } finally {
+    endInternalFsOp();
+  }
+});
+
+// ==================== 核心优化 5: 主进程持久化磁盘缩略图缓存 & 自定义缓存目录 (保护 C 盘) ====================
+function getThumbnailsDir() {
+  const cfg = readAppConfig();
+  const configuredDir = cfg.thumbnailCacheDir || getDefaultThumbnailCacheDir();
+  try {
+    fs.mkdirSync(configuredDir, { recursive: true });
+    return configuredDir;
+  } catch {
+    const fallback = getDefaultThumbnailCacheDir();
+    fs.mkdirSync(fallback, { recursive: true });
+    return fallback;
+  }
+}
+
+function getThumbnailCacheStats(dirPath) {
+  let count = 0;
+  let bytes = 0;
+  try {
+    if (dirPath && fs.existsSync(dirPath)) {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith('.jpg')) {
+          count += 1;
+          try {
+            bytes += fs.statSync(path.join(dirPath, e.name)).size;
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+  return { count, bytes };
+}
+
+async function migrateAndSwitchThumbnailCacheDir(newDirRaw) {
+  const resolvedNewDir = path.resolve(String(newDirRaw || '').trim() || getDefaultThumbnailCacheDir());
+  const oldDir = getThumbnailsDir();
+  await fsp.mkdir(resolvedNewDir, { recursive: true });
+
+  let migratedCount = 0;
+  if (oldDir && fs.existsSync(oldDir) && path.resolve(oldDir) !== resolvedNewDir) {
+    try {
+      const entries = await fsp.readdir(oldDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (!entry.name.endsWith('.jpg') && !entry.name.endsWith('.json')) continue;
+        const srcFile = path.join(oldDir, entry.name);
+        const destFile = path.join(resolvedNewDir, entry.name);
+        try {
+          if (!fs.existsSync(destFile)) {
+            await streamCopyFileSafe(srcFile, destFile);
+          }
+          await fsp.unlink(srcFile);
+          if (entry.name.endsWith('.jpg')) migratedCount += 1;
+        } catch {}
+      }
+    } catch {}
+  }
+
+  const cfg = readAppConfig();
+  cfg.thumbnailCacheDir = resolvedNewDir;
+  writeAppConfig(cfg);
+
+  const stats = getThumbnailCacheStats(resolvedNewDir);
+  return {
+    ok: true,
+    thumbnailCacheDir: resolvedNewDir,
+    migratedCount,
+    thumbnailCacheCount: stats.count,
+    thumbnailCacheBytes: stats.bytes,
+  };
+}
+
+ipcMain.handle('config:selectThumbnailCacheDir', async () => {
+  if (!mainWindow) return null;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择缩略图缓存目录 (建议选择 D 盘或 E 盘等大容量分区)',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
+    return null;
+  }
+  const chosenDir = result.filePaths[0];
+  return await migrateAndSwitchThumbnailCacheDir(chosenDir);
+});
+
+ipcMain.handle('config:setThumbnailCacheDir', async (_event, newDirPath) => {
+  if (!newDirPath || !String(newDirPath).trim()) {
+    return { ok: false, error: '无效的缓存目录路径' };
+  }
+  try {
+    return await migrateAndSwitchThumbnailCacheDir(String(newDirPath).trim());
+  } catch (err) {
+    return { ok: false, error: err?.message || '无法设置或迁移缩略图缓存目录' };
+  }
+});
+
+ipcMain.handle('fs:clearThumbnailCache', async () => {
+  const dir = getThumbnailsDir();
+  let deleted = 0;
+  try {
+    if (dir && fs.existsSync(dir)) {
+      const entries = await fsp.readdir(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && (e.name.endsWith('.jpg') || e.name.endsWith('.json'))) {
+          try {
+            await fsp.unlink(path.join(dir, e.name));
+            if (e.name.endsWith('.jpg')) deleted += 1;
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+  const stats = getThumbnailCacheStats(dir);
+  return {
+    ok: true,
+    deletedCount: deleted,
+    thumbnailCacheCount: stats.count,
+    thumbnailCacheBytes: stats.bytes,
+  };
+});
+
+function computeThumbnailHash(filePath, mtimeMs) {
+  const normalized = path.resolve(String(filePath || ''));
+  const mtime = Math.floor(Number(mtimeMs) || 0);
+  return crypto.createHash('md5').update(`${normalized}_${mtime}`).digest('hex');
+}
+
+function toLocalFileUrl(filePath, mtimeMs) {
+  const normalized = String(filePath || '').replace(/\\/g, '/');
+  const parts = normalized.split('/').map((seg, idx) => {
+    if (idx === 0 && /^[a-zA-Z]:$/.test(seg)) return seg;
+    return encodeURIComponent(seg);
+  });
+  const encodedPath = parts.join('/');
+  const prefix = encodedPath.startsWith('/') ? 'file://' : 'file:///';
+  const query = mtimeMs ? `?t=${Math.floor(mtimeMs)}` : '';
+  return `${prefix}${encodedPath}${query}`;
+}
+
+function formatBytesSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function checkIsMediaFile(fileName) {
+  if (!fileName || fileName.startsWith('.prism_')) return { isMedia: false, type: 'image' };
+  const lower = fileName.toLowerCase();
+  if (/\.(jpg|jpeg|png|webp|gif|svg|bmp|avif)$/.test(lower)) {
+    return { isMedia: true, type: 'image' };
+  }
+  if (/\.(mp4|webm|mov|mkv|avi|m4v|flv|wmv)$/.test(lower)) {
+    return { isMedia: true, type: 'video' };
+  }
+  return { isMedia: false, type: 'image' };
+}
+
+ipcMain.handle('fs:getThumbnail', async (_event, { filePath, mtimeMs }) => {
+  if (!filePath) return { hit: false };
+  try {
+    let effectiveMtime = mtimeMs;
+    if (!effectiveMtime && fs.existsSync(filePath)) {
+      effectiveMtime = fs.statSync(filePath).mtimeMs;
+    }
+    const hash = computeThumbnailHash(filePath, effectiveMtime);
+    const thumbDir = getThumbnailsDir();
+    const jpgPath = path.join(thumbDir, `${hash}.jpg`);
+    if (fs.existsSync(jpgPath)) {
+      let meta = {};
+      const jsonPath = path.join(thumbDir, `${hash}.json`);
+      if (fs.existsSync(jsonPath)) {
+        try {
+          meta = JSON.parse(await fsp.readFile(jsonPath, 'utf-8'));
+        } catch {}
+      }
+      return {
+        hit: true,
+        thumbUrl: toLocalFileUrl(jpgPath),
+        durationFormatted: meta.durationFormatted,
+        dimensions: meta.dimensions,
+      };
+    }
+  } catch {}
+  return { hit: false };
+});
+
+ipcMain.handle('fs:saveThumbnail', async (_event, { filePath, mtimeMs, base64Jpeg, durationFormatted, dimensions }) => {
+  if (!filePath || !base64Jpeg) return { ok: false };
+  try {
+    let effectiveMtime = mtimeMs;
+    if (!effectiveMtime && fs.existsSync(filePath)) {
+      effectiveMtime = fs.statSync(filePath).mtimeMs;
+    }
+    const hash = computeThumbnailHash(filePath, effectiveMtime);
+    const thumbDir = getThumbnailsDir();
+    const jpgPath = path.join(thumbDir, `${hash}.jpg`);
+    const cleanBase64 = base64Jpeg.includes(',') ? base64Jpeg.split(',')[1] : base64Jpeg;
+    await fsp.writeFile(jpgPath, Buffer.from(cleanBase64, 'base64'));
+
+    if (durationFormatted || dimensions) {
+      const jsonPath = path.join(thumbDir, `${hash}.json`);
+      await fsp.writeFile(
+        jsonPath,
+        JSON.stringify({ durationFormatted, dimensions }, null, 0),
+        'utf-8'
+      );
+    }
+
+    return {
+      ok: true,
+      thumbUrl: toLocalFileUrl(jpgPath),
+    };
+  } catch (err) {
+    return { ok: false, error: err?.message };
+  }
+});
+
+// ==================== 核心优化 6: IPC 数据分片流式扫描 (50 条/批，防主进程与渲染进程阻塞) ====================
+ipcMain.handle('fs:scanVaultChunked', async (event, { scanId } = {}) => {
+  const cfg = readAppConfig();
+  const rootPath = cfg.vaultRootPath;
+  if (!rootPath || !fs.existsSync(rootPath)) {
+    return {
+      ok: true,
+      categories: DEFAULT_CATEGORIES,
+      folders: [],
+      totalMedia: 0,
+      vaultRootPath: '',
+    };
+  }
+
+  ensureVaultStructure(rootPath);
+  const categories = readVaultCategories(rootPath);
+  const folders = [];
+  const allMedia = [];
+  const thumbDir = getThumbnailsDir();
+
+  for (const cat of categories) {
+    const secId = cat.id;
+    const secDirName = cat.dirName || cat.id;
+    const secPath = path.join(rootPath, secDirName);
+    if (!fs.existsSync(secPath)) {
+      fs.mkdirSync(secPath, { recursive: true });
+    }
+
+    let dirEntries = [];
+    try {
+      dirEntries = await fsp.readdir(secPath, { withFileTypes: true });
+    } catch {}
+
+    for (const entry of dirEntries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+
+      const folderPath = path.join(secPath, entry.name);
+      const metaPath = path.join(folderPath, '.prism_meta.json');
+      let stat;
+      try {
+        stat = await fsp.stat(folderPath);
+      } catch {
+        continue;
+      }
+
+      let meta = {
+        id: `folder-${secId}-${entry.name}`,
+        name: entry.name,
+        description: '',
+        coverFileName: '',
+        coverUrl: '',
+        createdAt: stat.birthtimeMs || stat.mtimeMs || Date.now(),
+        mediaSpecs: {},
+      };
+
+      if (fs.existsSync(metaPath)) {
+        try {
+          const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf-8'));
+          meta = { ...meta, ...parsed };
+        } catch {}
+      } else {
+        try {
+          await fsp.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+        } catch {}
+      }
+
+      let effectiveCoverUrl = meta.coverUrl || '';
+      if (meta.coverFileName) {
+        const coverPhysicalPath = path.join(folderPath, meta.coverFileName);
+        if (fs.existsSync(coverPhysicalPath)) {
+          try {
+            const coverStat = await fsp.stat(coverPhysicalPath);
+            effectiveCoverUrl = toLocalFileUrl(coverPhysicalPath, coverStat.mtimeMs);
+          } catch {}
+        }
+      }
+
+      const folderId = `${secId}::${entry.name}`;
+      folders.push({
+        id: folderId,
+        sectionId: secId,
+        name: meta.name || entry.name,
+        dirName: entry.name,
+        folderPath,
+        description: meta.description || '',
+        coverUrl: effectiveCoverUrl || undefined,
+        coverFileName: meta.coverFileName || undefined,
+        createdAt: meta.createdAt || stat.mtimeMs,
+      });
+
+      let files = [];
+      try {
+        files = await fsp.readdir(folderPath, { withFileTypes: true });
+      } catch {}
+
+      for (const f of files) {
+        if (!f.isFile()) continue;
+        const check = checkIsMediaFile(f.name);
+        if (!check.isMedia) continue;
+
+        const fullFilePath = path.join(folderPath, f.name);
+        let fStat;
+        try {
+          fStat = await fsp.stat(fullFilePath);
+        } catch {
+          continue;
+        }
+
+        const spec = (meta.mediaSpecs && meta.mediaSpecs[f.name]) || {};
+        const mtimeMs = Math.floor(fStat.mtimeMs || Date.now());
+        let thumbUrl = undefined;
+        let cachedDuration = spec.durationFormatted;
+        let cachedDimensions = spec.dimensions;
+
+        if (check.type === 'video') {
+          const hash = computeThumbnailHash(fullFilePath, mtimeMs);
+          const jpgPath = path.join(thumbDir, `${hash}.jpg`);
+          if (fs.existsSync(jpgPath)) {
+            thumbUrl = toLocalFileUrl(jpgPath);
+            const jsonPath = path.join(thumbDir, `${hash}.json`);
+            if (fs.existsSync(jsonPath)) {
+              try {
+                const sidecar = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+                if (sidecar.durationFormatted) cachedDuration = sidecar.durationFormatted;
+                if (sidecar.dimensions) cachedDimensions = sidecar.dimensions;
+              } catch {}
+            }
+          }
+        }
+
+        allMedia.push({
+          id: `${folderId}::${f.name}`,
+          folderId,
+          sectionId: secId,
+          name: f.name,
+          filePath: fullFilePath,
+          type: check.type,
+          url: toLocalFileUrl(fullFilePath, mtimeMs),
+          thumbUrl,
+          mtimeMs,
+          size: fStat.size,
+          sizeFormatted: formatBytesSize(fStat.size),
+          dimensions: cachedDimensions || (check.type === 'video' ? '1920 × 1080' : '高清原图'),
+          durationFormatted: cachedDuration || (check.type === 'video' ? '00:15' : undefined),
+          createdAt: spec.createdAt || mtimeMs,
+          tags: spec.tags || [],
+        });
+      }
+    }
+  }
+
+  // 分批推送媒体列表 (每批 50 条)，避免一次性序列化巨型 JSON 阻塞主进程或渲染进程
+  const CHUNK_SIZE = 50;
+  for (let i = 0; i < allMedia.length; i += CHUNK_SIZE) {
+    const chunk = allMedia.slice(i, i + CHUNK_SIZE);
+    if (!event.sender.isDestroyed()) {
+      event.sender.send('vault:mediaChunk', {
+        scanId,
+        chunk,
+        isFirst: i === 0,
+        isDone: i + CHUNK_SIZE >= allMedia.length,
+        total: allMedia.length,
+      });
+    }
+    if (i + CHUNK_SIZE < allMedia.length) {
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+
+  return {
+    ok: true,
+    categories,
+    folders,
+    totalMedia: allMedia.length,
+    vaultRootPath: rootPath,
+  };
 });
 
 app.on('window-all-closed', () => {

@@ -11,20 +11,50 @@
   }
 }
 
-/* Custom Windows Fluent scrollbars */
+/* Custom Windows Fluent scrollbars - Widened (12px) for easy mouse clicking & dragging */
 ::-webkit-scrollbar {
-  width: 7px;
-  height: 7px;
+  width: 12px;
+  height: 12px;
 }
 ::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(14, 165, 233, 0.22);
+  background: rgba(148, 163, 184, 0.12);
   border-radius: 9999px;
 }
+.dark ::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.45);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(14, 165, 233, 0.42);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 44px;
+  transition: background-color 0.15s ease;
+}
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(14, 165, 233, 0.45);
+  background: rgba(2, 132, 199, 0.82);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:active {
+  background: rgba(3, 105, 161, 0.98);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.38);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(56, 189, 248, 0.78);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.dark ::-webkit-scrollbar-thumb:active {
+  background: rgba(14, 165, 233, 0.98);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 /* Acrylic backdrop blur simulation */
