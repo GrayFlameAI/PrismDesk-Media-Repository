@@ -16,6 +16,12 @@ It parses embedded metadata from media files. All indexing and search run locall
 - Filter by tag, rating, date and file type
 - Virtual collections, batch operations
 - Non-destructive indexing: original files stay in place
+- # PrismDesk 媒体宝库
+
+> **[⬇️ 点击这里下载最新版安装包](https://github.com/GrayFlameAI/PrismDesk-Media-Repository/releases/latest)**
+
+Local-first media manager
+...
 ## ✨ Prismdesk媒体宝库
 
 本地媒体素材管理工具
