@@ -1,6 +1,6 @@
 <img width="1440" height="900" alt="image" src="https://github.com/user-attachments/assets/4a9f0975-a9fa-4513-aaeb-0a5e38ecd79c" />
 
-# rismdesk媒体宝库
+# Prismdesk媒体宝库
 
 Local-first  media manager
 
